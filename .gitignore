@@ -1,0 +1,34 @@
+# ===================================================
+# Git Ignore cho Veo3go AutoPromt
+# ===================================================
+
+# Binaries và file dung lượng lớn (>100MB bị GitHub từ chối)
+bin/
+*.exe
+*.dll
+*.rar
+*.zip
+*.7z
+*.tar.gz
+
+# Cache và file biên dịch Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.tmp
+
+# Nhật ký và file trạng thái runtime
+logs.txt
+crash_log.txt
+veo3_session.json
+
+# Thư mục ảnh tải về tạm thời
+downloads/
+shopee_images/
+
+# File backup
+*.bak*
+
+# File bản quyền và cấu hình cá nhân nhạy cảm
+veo3_accounts.json
+shopee_db_settings.json
