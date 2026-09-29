@@ -17,7 +17,7 @@ if %errorlevel% neq 0 (
     echo [LOI] May tinh nay chua cai dat Git!
     echo.
     echo Vui long tai va cai dat Git tai: https://git-scm.com/download/win
-    echo (Khi cai dat chi can bam Next lien tuc roi mo lai file update.bat nay).
+    echo - Khi cai dat chi can bam Next lien tuc roi mo lai file update.bat nay.
     echo.
     pause
     exit /b 1
