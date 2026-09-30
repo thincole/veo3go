@@ -69,6 +69,7 @@ from shopee_db_helper import (
     save_settings as save_shopee_settings,
     clean_product_title,
     build_tvc_prompt,
+    check_existing_shopee_video,
     ShopeeDatabaseClient,
     ShopeeClaimWorker,
     SCENES as SHOPEE_SCENES,
@@ -881,7 +882,7 @@ class ShopeeServerConfigDialog(QDialog):
         form.addWidget(self.txt_key)
 
         form.addWidget(QLabel("Client ID:"))
-        self.txt_cid = QLineEdit(self.settings.get("sv_client_id", "XEON-CT2A_822d66"))
+        self.txt_cid = QLineEdit(self.settings.get("sv_client_id", "XEON-CT2A_822d66_veo3go"))
         form.addWidget(self.txt_cid)
         layout.addLayout(form)
 
@@ -1323,6 +1324,25 @@ class WorkerThread(QThread):
             await self.pause_event.wait()
             task = await task_queue.get()
             task_id = task["task_id"]
+
+            # PRE-RENDER DUPLICATE SHIELD:
+            # Kiểm tra xem video của sản phẩm Shopee này đã tồn tại trên ổ đĩa chưa
+            # (output_dir hiện tại, F:\Video AI\PH\Veo3go, F:\Video AI\PH\Nova, F:\Video AI\PH\seedvis, F:\Video AI\PH...)
+            s_id = str(task.get("shopee_item_id") or "").strip()
+            if not s_id and task.get("start_image"):
+                base_stem = os.path.splitext(os.path.basename(task["start_image"]))[0]
+                m = re.search(r"(\d{9,})", base_stem)
+                if m:
+                    s_id = m.group(1)
+
+            if s_id:
+                existing_vid = check_existing_shopee_video(s_id, output_dir=self.output_dir)
+                if existing_vid:
+                    self.log_signal.emit(f"[{task_id}] ⚡ SP {s_id} đã có video tại [{existing_vid}]! Tự động bỏ qua để tránh render trùng.")
+                    self.progress_signal.emit(task_id, 100, "Đã có video (Bỏ qua)")
+                    await self.report_shopee_status(task, "Hoàn thành", existing_vid)
+                    self.task_done_signal.emit(task_id, existing_vid, "Hoàn thành")
+                    continue
             
             success = False
             retries = 0
@@ -3259,7 +3279,7 @@ class VeoLiteApp(QMainWindow):
     def start_shopee_claim_gui(self):
         url = self.shopee_settings.get("sv_server_url", "http://100.79.170.67:3000")
         key = self.shopee_settings.get("sv_api_key", "shopee_secret_2026")
-        cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66")
+        cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66_veo3go")
         mkt = self.combo_shopee_market.currentText()
         limit = self.spin_shopee_limit.value()
         sort_by = self.combo_shopee_sort.currentText()
@@ -3395,7 +3415,7 @@ class VeoLiteApp(QMainWindow):
         QMessageBox.warning(self, "Lỗi Shopee Database", err_msg)
 
     def release_shopee_stuck_gui(self):
-        cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66")
+        cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66_veo3go")
         if not cid:
             QMessageBox.warning(self, "Thiếu thông tin", "Vui lòng cấu hình Client ID.")
             return
@@ -4384,7 +4404,7 @@ class VeoLiteApp(QMainWindow):
         # 1. Tự động giải phóng các sản phẩm đang kẹt trên Shopee Database Server.
         # Chạy nền và chờ tối đa 5s để server chậm/mất kết nối không làm treo cửa sổ khi tắt.
         if hasattr(self, 'shopee_client'):
-            cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66")
+            cid = self.shopee_settings.get("sv_client_id", "XEON-CT2A_822d66_veo3go")
 
             def do_release():
                 try:

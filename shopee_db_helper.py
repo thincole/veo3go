@@ -17,7 +17,7 @@ import urllib.error
 DEFAULT_SETTINGS = {
     "sv_server_url": "http://100.79.170.67:3000",
     "sv_api_key": "shopee_secret_2026",
-    "sv_client_id": "XEON-CT2A_822d66",
+    "sv_client_id": "XEON-CT2A_822d66_veo3go",
     "seedvis_market": "PH",
     "seedvis_claim_limit": "100",
     "seedvis_sort_by": "Số bán cao nhất",
@@ -264,6 +264,20 @@ def build_tvc_prompt(product_name, market="PH", review_style="🎲 Random", scen
         return prompt, f"Review ({nat})"
 
 
+def check_existing_shopee_video(item_id, output_dir=None):
+    """Kiểm tra xem video của sản phẩm Shopee đã tồn tại trong thư mục xuất (output_dir) của máy này chưa."""
+    if not item_id or not output_dir:
+        return None
+    if not os.path.exists(output_dir):
+        return None
+    s_id = str(item_id).strip()
+    for cand_name in (f"{s_id}.mp4", f"{s_id}_12s.mp4"):
+        cand_path = os.path.join(output_dir, cand_name)
+        if os.path.exists(cand_path) and os.path.getsize(cand_path) > 10240:
+            return cand_path
+    return None
+
+
 class ShopeeDatabaseClient:
     """Client giao tiếp với Server Database PostgreSQL Shopee qua REST API."""
 
@@ -288,10 +302,16 @@ class ShopeeDatabaseClient:
             content = resp.read().decode("utf-8")
             return json.loads(content)
 
-    def claim_jobs(self, market="PH", client_id="XEON-CT2A_822d66", limit=100,
+    def claim_jobs(self, market="PH", client_id=None, limit=100,
                    sort_by="sold", min_item_id=40000000000, min_commission=1.0,
-                   min_sold=0, min_price=0.0, max_price=None):
+                   min_sold=0, min_price=0.0, max_price=None, tool="veo3go"):
         """Claim sản phẩm từ Server Database."""
+        if not client_id:
+            try:
+                client_id = load_settings().get("sv_client_id", "XEON-CT2A_822d66_veo3go")
+            except Exception:
+                client_id = "XEON-CT2A_822d66_veo3go"
+
         try:
             min_item_id = int(re.sub(r"\D", "", str(min_item_id)) or "0")
         except Exception:
@@ -316,6 +336,7 @@ class ShopeeDatabaseClient:
             "market": market,
             "clientId": client_id,
             "limit": int(limit),
+            "tool": tool,
             "sortBy": "commission" if "hoa hồng" in str(sort_by).lower() or sort_by == "commission" else "sold",
             "min_item_id": min_item_id,
             "min_commission": min_commission,
@@ -365,12 +386,12 @@ class ShopeeDatabaseClient:
 
         return products
 
-    def complete_job(self, item_id, status="completed", video_path="", extra=None, retries=3):
+    def complete_job(self, item_id, status="completed", video_path="", extra=None, retries=3, tool="veo3go"):
         """Báo cáo trạng thái video (completed, failed, vi phạm cs) về Server Database."""
         payload = {
             "itemId": str(item_id),
             "status": status,
-            "tool": "thinaptm"
+            "tool": tool
         }
         if video_path:
             payload["video_path"] = os.path.basename(video_path)
@@ -387,17 +408,18 @@ class ShopeeDatabaseClient:
                     time.sleep(2 * (attempt + 1))
         return False
 
-    def release_jobs(self, client_id="XEON-CT2A_822d66"):
-        """Giải phóng các sản phẩm đang kẹt (processing) của client_id."""
+    def release_jobs(self, client_id=None):
+        """Giải phóng các sản phẩm đang kẹt (processing) của client_id này."""
+        if not client_id:
+            try:
+                client_id = load_settings().get("sv_client_id", "XEON-CT2A_822d66_veo3go")
+            except Exception:
+                client_id = "XEON-CT2A_822d66_veo3go"
+
         released = 0
         try:
             r1 = self._request("POST", "/api/thinaptm/release-jobs", {"clientId": client_id})
             released += r1.get("released", 0) if isinstance(r1, dict) else 0
-        except Exception:
-            pass
-        try:
-            r2 = self._request("POST", "/api/thinaptm/auto-release-stuck", {"hours": 2})
-            released += r2.get("released", 0) if isinstance(r2, dict) else 0
         except Exception:
             pass
         return released
