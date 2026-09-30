@@ -424,6 +424,17 @@ class ShopeeDatabaseClient:
             pass
         return released
 
+    def release_single_job(self, item_id):
+        """Trả 1 sản phẩm về trạng thái pending khi gặp lỗi tạm thời phía máy chủ Veo."""
+        if not item_id:
+            return False
+        try:
+            r = self._request("POST", "/api/thinaptm/release-single-job", {"itemId": str(item_id)})
+            return r.get("success", False) if isinstance(r, dict) else False
+        except Exception:
+            return False
+
+
     @staticmethod
     def download_image(image_url, save_path, retries=3):
         """Tải ảnh Shopee CDN về thư mục cục bộ với retry khi chập chờn."""

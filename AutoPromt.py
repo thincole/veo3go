@@ -1117,6 +1117,23 @@ class WorkerThread(QThread):
         else:
             self.log_signal.emit(f"[Shopee DB] ⚠ Lỗi báo cáo SP {item_id}: {err}")
 
+    async def release_shopee_task(self, task, reason=""):
+        """Trả sản phẩm Shopee về trạng thái pending khi máy chủ Veo bị lỗi/timeout/nghẽn."""
+        item_id = task.get("shopee_item_id")
+        if not self.shopee_client or not item_id:
+            return
+        def do_release(iid):
+            try:
+                return self.shopee_client.release_single_job(str(iid))
+            except Exception:
+                return False
+        ok = await asyncio.to_thread(do_release, item_id)
+        if ok:
+            self.log_signal.emit(f"[Shopee DB] 🔄 Đã trả SP {item_id} về 'pending' do lỗi máy chủ Veo ({reason})")
+        else:
+            self.log_signal.emit(f"[Shopee DB] ⚠ Không thể trả SP {item_id} về pending: {reason}")
+
+
     def _init_accounts_pool(self, client, accounts_pool):
         self.default_hardware_id = client.hardware_id
         self.default_cpu_id = client.cpu_id
@@ -1460,18 +1477,24 @@ class WorkerThread(QThread):
                     success = True
                 except DailyLimitExceeded:
                     self.log_signal.emit(
-                        f"[Hệ thống] ⚠ Tài khoản {acc['email']} chạm cap 199 prompt/phiên! "
-                        f"Đang reset phiên WebSocket để lấy kết nối mới với bộ đếm sạch..."
+                        f"[Hệ thống] ⚠ Máy chủ Veo chạm hạn mức / nghẽn quota ({acc['email']})! "
+                        f"Đang reset phiên WebSocket và tạm dừng 15s để xả tải..."
                     )
-                    self.progress_signal.emit(task_id, 5, "Đang reset phiên WebSocket...")
-                    self.release_account(acc, cooldown_seconds=0)
+                    self.progress_signal.emit(task_id, 5, "Đang reset phiên & chờ xả tải...")
+                    self.release_account(acc, cooldown_seconds=15)
                     try:
                         # Đóng phiên cũ + xóa khỏi cache → lần kết nối tiếp theo mở phiên mới
                         await self.reset_session_for_account(acc)
                     except BaseException as reset_err:
                         self.log_signal.emit(f"[Hệ thống] ⚠ Lỗi khi reset phiên: {reset_err}")
-                    self.log_signal.emit(f"[Hệ thống] ✅ Đã reset phiên. Đang thử lại tác vụ [{task_id}] trên phiên mới...")
+                    await asyncio.sleep(10)
                     retries += 1
+                    if retries >= 3:
+                        self.log_signal.emit(f"[{task_id}] Máy chủ Veo nghẽn quota quá 3 lần liên tiếp. Trả sản phẩm về hàng đợi pending...")
+                        await self.release_shopee_task(task, "Nghẽn quota máy chủ Veo")
+                        self.task_done_signal.emit(task_id, "", "Lỗi: Máy chủ Veo nghẽn quota (đã trả về pending)")
+                        break
+                    self.log_signal.emit(f"[Hệ thống] ✅ Đã reset phiên. Đang thử lại tác vụ [{task_id}] (lần {retries}/3)...")
                     continue
                 except Exception as e:
                     err_str = str(e)
@@ -1603,11 +1626,11 @@ class WorkerThread(QThread):
             # Vòng lặp nhận kết quả cho task này
             while self.is_running:
                 try:
-                    event, data = await asyncio.wait_for(q.get(), timeout=360)
+                    event, data = await asyncio.wait_for(q.get(), timeout=900)
                 except asyncio.TimeoutError:
-                    self.log_signal.emit(f"[{task_id}] Hết thời gian chờ phản hồi từ server (6 phút).")
-                    await self.report_shopee_status(task, "Lỗi: Timeout chờ kết quả", "")
-                    self.task_done_signal.emit(task_id, "", "Lỗi: Timeout chờ kết quả")
+                    self.log_signal.emit(f"[{task_id}] Hết thời gian chờ phản hồi từ server (15 phút). Trả sản phẩm về hàng đợi pending...")
+                    await self.release_shopee_task(task, "Timeout hàng chờ 15 phút")
+                    self.task_done_signal.emit(task_id, "", "Lỗi: Timeout chờ kết quả (đã trả về pending)")
                     return False
 
                 if event == "ws_closed":
@@ -1716,7 +1739,7 @@ class WorkerThread(QThread):
                     else:
                         # Kiểm tra xem có phải server báo chạm quota/cap không
                         raw_err = data.get("error") or data.get("code") or data.get("message") or ""
-                        if any(x in str(raw_err).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap"]):
+                        if any(x in str(raw_err).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
                             raise DailyLimitExceeded()
 
                         # Không có video: thường do Veo từ chối tạo (bộ lọc bản quyền / an toàn),
@@ -1724,14 +1747,13 @@ class WorkerThread(QThread):
                         res_lbl, code = classify_veo_error(data)
                         if res_lbl:
                             self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo video: {code} → {res_lbl}. Sản phẩm này sẽ bị loại khỏi hàng chờ.")
+                            await self.report_shopee_status(task, res_lbl, "")
                         else:
-                            if raw_err:
-                                res_lbl = f"Lỗi: {raw_err}"
-                                self.log_signal.emit(f"[{task_id}] Server báo lỗi khi tạo video: {raw_err}")
-                            else:
-                                res_lbl = "Lỗi: Không tìm thấy dữ liệu video"
-                                self.log_signal.emit(f"[{task_id}] Lỗi: Không tìm thấy dữ liệu video hoặc link tải. Data: {json.dumps(data)}")
-                        await self.report_shopee_status(task, res_lbl, "")
+                            err_detail = raw_err or "Không tìm thấy dữ liệu video"
+                            self.log_signal.emit(f"[{task_id}] Máy chủ Veo gặp sự cố: {err_detail}. Trả sản phẩm về hàng đợi pending...")
+                            await self.release_shopee_task(task, str(err_detail))
+                            res_lbl = f"Lỗi server: {err_detail}"
+
                         self.task_done_signal.emit(task_id, "", res_lbl)
                         return False
                         
@@ -1769,15 +1791,18 @@ class WorkerThread(QThread):
                     return True
                 elif event in ("error", "job_error"):
                     err_msg = data.get("message") or data.get("detail") or data.get("reason") or data.get("error") or "Lỗi server không xác định"
-                    if any(x in str(err_msg).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap"]):
+                    if any(x in str(err_msg).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
                         raise DailyLimitExceeded()
                     
                     res_label, code = classify_veo_error(data)
                     if res_label:
                         self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo video: {code} → {res_label}. Sản phẩm này sẽ bị loại khỏi hàng chờ.")
+                        await self.report_shopee_status(task, res_label, "")
                     else:
-                        res_label = f"Lỗi: {err_msg}"
-                    await self.report_shopee_status(task, res_label, "")
+                        self.log_signal.emit(f"[{task_id}] Máy chủ Veo báo lỗi ({err_msg}). Trả sản phẩm về hàng đợi pending...")
+                        await self.release_shopee_task(task, str(err_msg))
+                        res_label = f"Lỗi server: {err_msg}"
+
                     self.task_done_signal.emit(task_id, "", res_label)
                     return False
             return False
