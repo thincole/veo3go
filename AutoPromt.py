@@ -55,13 +55,13 @@ import websockets
 import re
 import shutil
 import subprocess
-from PySide6.QtCore import QThread, Signal, QObject, Qt, Slot, QRect, QTimer
+from PySide6.QtCore import QThread, Signal, QObject, Qt, Slot, QRect, QTimer, QPoint, QSize, QEvent
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
                              QFileDialog, QProgressBar, QTextEdit, QComboBox, QCheckBox,
                              QHeaderView, QMessageBox, QTabWidget, QSplitter, QFrame,
                              QSpinBox, QDialog, QPlainTextEdit, QStyle, QStyleOptionButton,
-                             QGroupBox)
+                             QGroupBox, QScrollArea, QLayout)
 from PySide6.QtGui import QColor, QFont, QIcon
 
 from shopee_db_helper import (
@@ -77,6 +77,7 @@ from shopee_db_helper import (
     MARKETS as SHOPEE_MARKETS,
     DEFAULT_SETTINGS as SHOPEE_DEFAULT_SETTINGS
 )
+import shopee_link_helper
 
 
 import threading
@@ -1090,6 +1091,10 @@ class WorkerThread(QThread):
         self.shopee_client = shopee_client
         self.is_running = True
         self.stop_requested = False
+        self.force_stopped = False   # True khi người dùng bấm Dừng lần 2 (dừng ngay)
+        self._loop = None            # asyncio loop của luồng worker (để hủy từ luồng GUI)
+        self._workers = []
+        self._inflight = {}          # worker_id -> task đang xử lý dở
         self.max_workers = max_workers
         self.naming_mode = naming_mode
         self.account_sessions = {}
@@ -1166,8 +1171,19 @@ class WorkerThread(QThread):
         self.log_signal.emit("[Hệ thống] Nhận yêu cầu dừng: Không nhận thêm tác vụ mới, đang hoàn thành nốt các tác vụ đang chạy...")
 
     def stop(self):
+        """Dừng ngay: không nhận thêm job và hủy luôn các job đang chạy dở."""
         self.stop_requested = True
         self.is_running = False
+        self.force_stopped = True
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            def _cancel_all():
+                for t in list(self._workers):
+                    t.cancel()
+            try:
+                loop.call_soon_threadsafe(_cancel_all)
+            except RuntimeError:
+                pass
 
     def get_or_create_session(self, acc):
         email = acc.get("email") or acc.get("api_key")
@@ -1323,29 +1339,64 @@ class WorkerThread(QThread):
         workers = []
         for i in range(max_workers):
             workers.append(asyncio.create_task(self.worker_loop(task_queue, worker_id=i)))
+        self._loop = asyncio.get_running_loop()
+        self._workers = workers
 
         try:
-            await asyncio.gather(*workers)
+            # return_exceptions=True: khi dừng cứng (hủy worker) không văng CancelledError ra ngoài
+            await asyncio.gather(*workers, return_exceptions=True)
         finally:
+            # Dừng cứng: các task đang chạy dở bị ngắt giữa chừng -> đánh dấu & trả SP về pending
+            if self.force_stopped:
+                for t in list(self._inflight.values()):
+                    if not t:
+                        continue
+                    try:
+                        self.task_done_signal.emit(t["task_id"], "", "Đã dừng (bị ngắt giữa chừng)")
+                        await self.release_shopee_task(t, "Người dùng dừng ngay")
+                    except BaseException:
+                        pass
+            self._inflight.clear()
             # Dọn dẹp đóng các kết nối WebSocket session
             for sess in list(self.account_sessions.values()):
                 try:
                     await sess.close()
-                except Exception:
+                except BaseException:
                     pass
             self.account_sessions.clear()
             self.finished_signal.emit()
 
     async def worker_loop(self, task_queue, worker_id=0):
         while not task_queue.empty() and not self.stop_requested and self.is_running:
+            self._inflight[worker_id] = None
             await self.pause_event.wait()
             task = await task_queue.get()
+            self._inflight[worker_id] = task
             task_id = task["task_id"]
+
+            # SP nhập từ "Import Link": cào tên + URL ảnh từ link khi tới lượt (ảnh tải ở bước lazy phía dưới)
+            if task.get("shopee_link") and not task.get("shopee_image_url"):
+                self.progress_signal.emit(task_id, 1, "Đang lấy thông tin từ link...")
+                link_url = task["shopee_link"]
+                self.log_signal.emit(f"[{task_id}] [Import Link] Đang cào thông tin SP: {link_url[:70]}")
+                info = await asyncio.to_thread(shopee_link_helper.fetch_product, link_url)
+                if not info.get("ok"):
+                    err = info.get("error") or "Không lấy được dữ liệu"
+                    self.log_signal.emit(f"[{task_id}] [Import Link] ❌ Lỗi cào link: {err}")
+                    self.task_done_signal.emit(task_id, "", f"Lỗi cào link: {err}")
+                    continue
+                task["shopee_image_url"] = info["image_url"]
+                task["shopee_name"] = info.get("title") or task.get("shopee_name") or ""
+                if info.get("market") and not task.get("shopee_market"):
+                    task["shopee_market"] = info["market"]
+                if info.get("item_id") and not task.get("link_item_id"):
+                    task["link_item_id"] = info["item_id"]
+                self.log_signal.emit(f"[{task_id}] [Import Link] ✅ {task['shopee_name'][:60]} (ID {task.get('link_item_id') or '?'})")
 
             # PRE-RENDER DUPLICATE SHIELD:
             # Kiểm tra xem video của sản phẩm Shopee này đã tồn tại trên ổ đĩa chưa
             # (output_dir hiện tại, F:\Video AI\PH\Veo3go, F:\Video AI\PH\Nova, F:\Video AI\PH\seedvis, F:\Video AI\PH...)
-            s_id = str(task.get("shopee_item_id") or "").strip()
+            s_id = str(task.get("shopee_item_id") or task.get("link_item_id") or "").strip()
             if not s_id and task.get("start_image"):
                 base_stem = os.path.splitext(os.path.basename(task["start_image"]))[0]
                 m = re.search(r"(\d{9,})", base_stem)
@@ -1403,15 +1454,15 @@ class WorkerThread(QThread):
 
                 # On-demand tải ảnh & sinh Prompt TVC cho sản phẩm Shopee khi tới lượt chạy
                 if task.get("is_lazy_shopee"):
-                    s_id = str(task.get("shopee_item_id", ""))
-                    s_mkt = task.get("shopee_market", "PH")
+                    s_id = str(task.get("shopee_item_id") or task.get("link_item_id") or task_id[:8])
+                    s_mkt = task.get("shopee_market") or ("PH" if task.get("shopee_item_id") else "")
                     s_url = task.get("shopee_image_url", "")
                     s_name = task.get("shopee_name", "")
 
                     curr_dir = os.path.dirname(os.path.abspath(__file__))
                     out_dir = os.path.join(curr_dir, "downloads", "shopee_images")
                     os.makedirs(out_dir, exist_ok=True)
-                    img_path = os.path.join(out_dir, f"{s_mkt}_{s_id}.jpg")
+                    img_path = os.path.join(out_dir, f"{s_mkt + '_' if s_mkt else ''}{s_id}.jpg")
 
                     # 1. Tải ảnh nếu chưa có trên ổ đĩa
                     if not os.path.exists(img_path) or os.path.getsize(img_path) == 0:
@@ -1424,6 +1475,9 @@ class WorkerThread(QThread):
                                     f_out.write(resp.read())
                                 return True
                             except Exception as e:
+                                # Dự phòng: tải bằng curl_cffi (giả lập trình duyệt) nếu Shopee chặn urllib
+                                if shopee_link_helper.download_image(s_url, img_path):
+                                    return True
                                 return str(e)
                         dl_res = await asyncio.to_thread(do_download)
                         if dl_res is not True:
@@ -1692,7 +1746,7 @@ class WorkerThread(QThread):
                             
                     img_name = "result"
                     mode_str = str(getattr(self, "naming_mode", "Theo Item ID"))
-                    item_id = task.get("shopee_item_id")
+                    item_id = task.get("shopee_item_id") or task.get("link_item_id")
                     row_idx = task.get("row_index", 0) + 1
                     prompt_str = task.get("prompt", "").strip()
 
@@ -2751,6 +2805,88 @@ class ShopeeReleaseWorker(QThread):
             self.error_signal.emit(str(e))
 
 
+class FlowLayout(QLayout):
+    """Layout xếp widget thành hàng, tự xuống dòng khi hết chỗ (mỗi dòng căn giữa theo chiều dọc).
+    Dùng thay QHBoxLayout cho các hàng nhiều nút/ô nhập để cột có thể co hẹp mà không bị cắt."""
+
+    def __init__(self, parent=None, hspacing=8, vspacing=6):
+        super().__init__(parent)
+        self._items = []
+        self._hspace = hspacing
+        self._vspace = vspacing
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def addStretch(self, *args):
+        """Tương thích với QHBoxLayout.addStretch (flow không cần giãn)."""
+        pass
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        # Gom item thành các dòng
+        lines, cur, cur_w = [], [], 0
+        for item in self._items:
+            sz = item.sizeHint()
+            if item.isEmpty() and sz.width() == 0:
+                continue
+            need = sz.width() + (self._hspace if cur else 0)
+            if cur and cur_w + need > eff.width():
+                lines.append(cur)
+                cur, cur_w, need = [], 0, sz.width()
+            cur.append((item, sz))
+            cur_w += need
+        if cur:
+            lines.append(cur)
+        # Đặt vị trí
+        y = eff.y()
+        for line in lines:
+            line_h = max(sz.height() for _, sz in line)
+            x = eff.x()
+            if not test_only:
+                for item, sz in line:
+                    item.setGeometry(QRect(QPoint(x, y + (line_h - sz.height()) // 2), sz))
+                    x += sz.width() + self._hspace
+            y += line_h + self._vspace
+        if lines:
+            y -= self._vspace
+        return y - rect.y() + m.bottom()
+
+
 class VeoLiteApp(QMainWindow):
     gui_log_signal = Signal(str)
 
@@ -2798,11 +2934,19 @@ class VeoLiteApp(QMainWindow):
         self.task_shopee_map = {}
         self.shopee_claim_worker = None
 
+        # Chế độ chạy liên tục: tự lấy SP từ Database khi hàng chờ hết
+        self.AUTO_REFILL_RETRY_SECONDS = 120
+        self._auto_refill_in_progress = False
+        self._auto_starting = False
+        self._auto_refill_timer = QTimer(self)
+        self._auto_refill_timer.setSingleShot(True)
+        self._auto_refill_timer.timeout.connect(self.auto_refill_and_run)
+
         self.init_ui()
 
     def init_ui(self):
         self.setWindowTitle("AutoPromt Veo3go - Version 1.5.5")
-        self.resize(1100, 750)
+        self.resize(1400, 780)
         self.setStyleSheet(STYLING)
         
         main_widget = QWidget()
@@ -2810,6 +2954,7 @@ class VeoLiteApp(QMainWindow):
         main_layout = QVBoxLayout(main_widget)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(12)
+        root_layout = main_layout
 
         # Header bar
         header_layout = QHBoxLayout()
@@ -2840,7 +2985,7 @@ class VeoLiteApp(QMainWindow):
         main_layout.addWidget(divider)
         
         # Settings Bar
-        settings_layout = QHBoxLayout()
+        settings_layout = FlowLayout()
         
         # Max concurrent threads spinbox
         settings_layout.addWidget(QLabel("⚡ Số luồng song song (Unlimited 5):"))
@@ -2889,7 +3034,7 @@ class VeoLiteApp(QMainWindow):
         main_layout.addLayout(settings_layout)
         
         # Accounts Pool Bar
-        accounts_layout = QHBoxLayout()
+        accounts_layout = FlowLayout()
         accounts_layout.addWidget(QLabel("Danh sách tài khoản (Pool):"))
         self.lbl_accounts_count = QLabel("0 tài khoản")
         self.lbl_accounts_count.setStyleSheet("color: #00F0FF; font-weight: bold;")
@@ -2908,9 +3053,29 @@ class VeoLiteApp(QMainWindow):
         accounts_layout.addStretch()
         main_layout.addLayout(accounts_layout)
 
+        # Khung nhật ký xử lý: được đặt cạnh bảng sản phẩm (xem setup_tab_i2v), độ rộng 50/50
+        self.log_panel = QWidget()
+        log_layout = QVBoxLayout(self.log_panel)
+        log_layout.setContentsMargins(0, 0, 0, 0)
+        log_header_layout = QHBoxLayout()
+        log_header_label = QLabel("Nhật ký xử lý (Logs):")
+        log_header_label.setMinimumWidth(1)
+        log_header_layout.addWidget(log_header_label)
+        log_header_layout.addStretch()
+        self.lbl_avg_speed = QLabel("Số Video trung bình/phút: --")
+        self.lbl_avg_speed.setMinimumWidth(1)
+        self.lbl_avg_speed.setStyleSheet("color: #00E5FF; font-weight: bold;")
+        log_header_layout.addWidget(self.lbl_avg_speed)
+        log_layout.addLayout(log_header_layout)
+        self.log_console = QPlainTextEdit()
+        self.log_console.setReadOnly(True)
+        self.log_console.setMaximumBlockCount(2000)
+        self.log_console.setStyleSheet("font-family: Consolas, monospace; background-color: #0B0B12; border: 1px solid #1F2135; color: #FFFFFF;")
+        log_layout.addWidget(self.log_console)
+
         # Tab widgets for Modes
         self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
+        main_layout.addWidget(self.tabs, 1)
         
         # Tab 1: Image to Video
         self.tab_i2v = QWidget()
@@ -2924,30 +3089,6 @@ class VeoLiteApp(QMainWindow):
         
         # Hide tab bar as we only have 1 active mode tab now
         self.tabs.tabBar().hide()
-        
-        # Bottom controls and logs (using Splitter)
-        bottom_splitter = QSplitter(Qt.Vertical)
-        main_layout.addWidget(bottom_splitter)
-        
-        # Console Log Panel
-        log_panel = QWidget()
-        log_layout = QVBoxLayout(log_panel)
-        log_layout.setContentsMargins(0, 5, 0, 0)
-        log_header_layout = QHBoxLayout()
-        log_header_label = QLabel("Nhật ký xử lý (Logs):")
-        log_header_layout.addWidget(log_header_label)
-        log_header_layout.addStretch()
-        self.lbl_avg_speed = QLabel("Số Video trung bình/phút: --")
-        self.lbl_avg_speed.setStyleSheet("color: #00E5FF; font-weight: bold;")
-        log_header_layout.addWidget(self.lbl_avg_speed)
-        log_layout.addLayout(log_header_layout)
-        self.log_console = QPlainTextEdit()
-        self.log_console.setReadOnly(True)
-        self.log_console.setMaximumBlockCount(2000)
-        self.log_console.setStyleSheet("font-family: Consolas, monospace; background-color: #0B0B12; border: 1px solid #1F2135; color: #FFFFFF;")
-        log_layout.addWidget(self.log_console)
-        
-        bottom_splitter.addWidget(log_panel)
         
         # Progress and Run Panel
         run_panel = QWidget()
@@ -2970,7 +3111,7 @@ class VeoLiteApp(QMainWindow):
         self.btn_stop.clicked.connect(self.stop_queue)
         run_layout.addWidget(self.btn_stop)
         
-        main_layout.addWidget(run_panel)
+        root_layout.addWidget(run_panel)
         self.load_session()
         self.load_accounts_pool()
 
@@ -3016,6 +3157,10 @@ class VeoLiteApp(QMainWindow):
         put("seedvis_min_item_id", "txt_shopee_min_id", lambda w: w.text().strip())
         put("seedvis_min_commission", "txt_shopee_min_comm", lambda w: w.text().strip())
         put("seedvis_min_sold", "txt_shopee_min_sold", lambda w: w.text().strip())
+        put("seedvis_auto_refill", "chk_auto_refill", lambda w: w.isChecked())
+        # Combo AI Prompt chỉ còn "Template" khi độ dài 8s => lưu lựa chọn thật của người dùng
+        if hasattr(self, "_ai_prompt_pref"):
+            s["seedvis_ai_prompt"] = self._ai_prompt_pref
         return s
 
     def save_all_settings(self, quiet=True):
@@ -3032,6 +3177,28 @@ class VeoLiteApp(QMainWindow):
             else:
                 print("Lỗi lưu cài đặt:", e)
             return False
+
+    AI_PROMPT_TEMPLATE = "Template (mặc định)"
+    AI_PROMPT_ALL = ["Prompt A + B", "Template (mặc định)", "Gemini", "Groq"]
+
+    def _on_ai_prompt_changed(self, text):
+        """Nhớ lựa chọn AI Prompt của người dùng (chỉ khi đang hiện đủ danh sách, tức độ dài 16s/24s)."""
+        if self.combo_ai_prompt.count() > 1 and text:
+            self._ai_prompt_pref = text
+
+    def update_ai_prompt_options(self):
+        """Độ dài 8s: chỉ hiện Template (mặc định). 16s/24s: hiện đủ và khôi phục lựa chọn trước đó."""
+        cb = self.combo_ai_prompt
+        is_8s = self.combo_duration.currentText().strip().startswith("8")
+        cb.blockSignals(True)
+        cb.clear()
+        if is_8s:
+            cb.addItem(self.AI_PROMPT_TEMPLATE)
+        else:
+            cb.addItems(self.AI_PROMPT_ALL)
+            pref = getattr(self, "_ai_prompt_pref", self.AI_PROMPT_TEMPLATE)
+            cb.setCurrentText(pref if pref in self.AI_PROMPT_ALL else self.AI_PROMPT_TEMPLATE)
+        cb.blockSignals(False)
 
     def setup_video_settings_panel(self, parent_layout):
         cfg_box = QGroupBox("⚙ Cài đặt Video")
@@ -3055,7 +3222,7 @@ class VeoLiteApp(QMainWindow):
         cfg_layout.setSpacing(6)
 
         # Row 1: Tỉ lệ, Khung cảnh, Độ dài, Ngôn ngữ
-        row1 = QHBoxLayout()
+        row1 = FlowLayout()
         row1.addWidget(QLabel("Tỉ lệ:"))
         self.combo_aspect = QComboBox()
         self.combo_aspect.addItems(["Dọc 9:16 (TikTok)", "Ngang 16:9", "Vuông 1:1"])
@@ -3069,11 +3236,11 @@ class VeoLiteApp(QMainWindow):
             self.combo_scene.addItem(s[0])
         self.combo_scene.setCurrentText(self.shopee_settings.get("seedvis_scene", "🎲 Random"))
         self.combo_scene.setStyleSheet("background-color: #1e1e2f; color: #ffffff; border: 1px solid #2F324D; border-radius: 4px; padding: 3px;")
-        row1.addWidget(self.combo_scene, 1)
+        row1.addWidget(self.combo_scene)
 
         row1.addWidget(QLabel("Độ dài:"))
         self.combo_duration = QComboBox()
-        self.combo_duration.addItems(["8s (Chuẩn 1.5.5)", "16s", "24s", "5s"])
+        self.combo_duration.addItems(["8s (Chuẩn 1.5.5)", "16s", "24s"])
         self.combo_duration.setCurrentText(self.shopee_settings.get("seedvis_total_dur", "8s (Chuẩn 1.5.5)"))
         self.combo_duration.setStyleSheet("background-color: #1e1e2f; color: #ffffff; border: 1px solid #2F324D; border-radius: 4px; padding: 3px;")
         row1.addWidget(self.combo_duration)
@@ -3088,13 +3255,13 @@ class VeoLiteApp(QMainWindow):
         cfg_layout.addLayout(row1)
 
         # Row 2: Kiểu Review, AI Prompt, Test Prompt, AI Keys, Xóa ảnh, Ghép ảnh
-        row2 = QHBoxLayout()
+        row2 = FlowLayout()
         row2.addWidget(QLabel("Kiểu Review:"))
         self.combo_review_style = QComboBox()
         self.combo_review_style.addItems(SHOPEE_REVIEW_STYLES)
         self.combo_review_style.setCurrentText(self.shopee_settings.get("seedvis_review_style", "🎲 Random"))
         self.combo_review_style.setStyleSheet("background-color: #1e1e2f; color: #ffffff; border: 1px solid #2F324D; border-radius: 4px; padding: 3px;")
-        row2.addWidget(self.combo_review_style, 1)
+        row2.addWidget(self.combo_review_style)
 
         row2.addWidget(QLabel("AI Prompt:"))
         self.combo_ai_prompt = QComboBox()
@@ -3102,6 +3269,12 @@ class VeoLiteApp(QMainWindow):
         self.combo_ai_prompt.setCurrentText(self.shopee_settings.get("seedvis_ai_prompt", "Prompt A + B"))
         self.combo_ai_prompt.setStyleSheet("background-color: #1e1e2f; color: #ffffff; border: 1px solid #2F324D; border-radius: 4px; padding: 3px;")
         row2.addWidget(self.combo_ai_prompt)
+
+        # Độ dài 8s chỉ dùng "Template (mặc định)"; 16s/24s mới có đủ các chế độ AI Prompt
+        self._ai_prompt_pref = self.combo_ai_prompt.currentText()
+        self.combo_ai_prompt.currentTextChanged.connect(self._on_ai_prompt_changed)
+        self.combo_duration.currentTextChanged.connect(lambda _t: self.update_ai_prompt_options())
+        self.update_ai_prompt_options()
 
         self.btn_test_prompt = QPushButton("🧪 Test Prompt")
         self.btn_test_prompt.setStyleSheet("background-color: #5f6368; color: #ffffff; font-weight: bold; padding: 4px 10px; border-radius: 4px;")
@@ -3164,6 +3337,12 @@ class VeoLiteApp(QMainWindow):
         btn_browse_out.clicked.connect(self.browse_output_dir)
         row3.addWidget(btn_browse_out)
 
+        btn_open_out = QPushButton("📂 Mở Folder")
+        btn_open_out.setToolTip("Mở thư mục lưu video trong Windows Explorer")
+        btn_open_out.setStyleSheet("background-color: #00B4D8; color: #FFFFFF; font-weight: bold; padding: 4px 12px; border-radius: 4px;")
+        btn_open_out.clicked.connect(self.open_output_dir)
+        row3.addWidget(btn_open_out)
+
         cfg_layout.addLayout(row3)
         parent_layout.addWidget(cfg_box)
 
@@ -3189,7 +3368,7 @@ class VeoLiteApp(QMainWindow):
         claim_layout.setSpacing(6)
 
         # Row 1: Số lượng, Ưu tiên, Thị trường, ItemID từ, Hoa hồng từ, SL bán từ
-        claim_row = QHBoxLayout()
+        claim_row = FlowLayout()
         claim_row.addWidget(QLabel("Số lượng:"))
         self.spin_shopee_limit = QSpinBox()
         self.spin_shopee_limit.setRange(1, 999999999)
@@ -3242,7 +3421,7 @@ class VeoLiteApp(QMainWindow):
         claim_layout.addLayout(claim_row)
 
         # Row 2: Nút hành động & Cấu hình Server
-        act_row = QHBoxLayout()
+        act_row = FlowLayout()
         self.btn_shopee_claim = QPushButton("📥 Lấy SP từ Database & Sinh Prompt")
         self.btn_shopee_claim.setStyleSheet("background-color: #00F0FF; color: #0B0B12; font-weight: bold; padding: 6px 14px; font-size: 13px; border-radius: 4px;")
         self.btn_shopee_claim.clicked.connect(self.start_shopee_claim_gui)
@@ -3258,6 +3437,15 @@ class VeoLiteApp(QMainWindow):
         self.btn_shopee_server_cfg.setStyleSheet("background-color: #2F324D; color: #ffffff; padding: 6px 12px; border-radius: 4px;")
         self.btn_shopee_server_cfg.clicked.connect(self.open_shopee_server_config_dialog)
         act_row.addWidget(self.btn_shopee_server_cfg)
+
+        self.chk_auto_refill = QCheckBox("♾ Tự động lấy SP khi hết (chạy liên tục)")
+        self.chk_auto_refill.setToolTip(
+            "Khi hàng chờ chạy xong, phần mềm tự lấy lô SP mới từ Database (theo bộ lọc & số lượng ở trên) rồi chạy tiếp.\n"
+            "Nếu Database tạm hết SP hoặc lỗi mạng, sẽ tự thử lại sau ít phút. Bấm 'Dừng tự động' để thoát."
+        )
+        self.chk_auto_refill.setStyleSheet("color: #00F0FF; font-weight: bold; margin-left: 8px;")
+        self.chk_auto_refill.setChecked(bool(self.shopee_settings.get("seedvis_auto_refill", False)))
+        act_row.addWidget(self.chk_auto_refill)
 
         self.lbl_shopee_status = QLabel("Trạng thái: Sẵn sàng kết nối")
         self.lbl_shopee_status.setStyleSheet("color: #A0A5C0; font-style: italic; margin-left: 8px;")
@@ -3350,12 +3538,16 @@ class VeoLiteApp(QMainWindow):
 
     @Slot(list)
     def on_shopee_claim_finished(self, valid_items):
+        auto = self._auto_refill_in_progress
+        self._auto_refill_in_progress = False
         self.btn_shopee_claim.setEnabled(True)
         self.btn_shopee_claim.setText("📥 Lấy SP từ Database & Sinh Prompt")
         self.lbl_shopee_status.setText(f"Hoàn tất: Đã nạp {len(valid_items)} sản phẩm!")
 
         if not valid_items:
             self.log("[Shopee DB] Không có sản phẩm nào hợp lệ để nạp.")
+            if auto:
+                self._schedule_auto_refill_retry("Database hiện chưa có SP mới.")
             return
 
         self.tbl_i2v.setUpdatesEnabled(False)
@@ -3431,12 +3623,21 @@ class VeoLiteApp(QMainWindow):
         self.tbl_i2v.setUpdatesEnabled(True)
         self.log(f"[Shopee DB] 🎉 Đã nạp thành công {len(valid_items)} sản phẩm Shopee vào danh sách! (Ảnh & Prompt sẽ được tạo on-demand khi chạy)")
 
+        if auto and self.chk_auto_refill.isChecked():
+            self.log("[Tự động] Đã có SP mới, tiếp tục chạy queue...")
+            self._auto_run_queue()
+
     @Slot(str)
     def on_shopee_claim_error(self, err_msg):
+        auto = self._auto_refill_in_progress
+        self._auto_refill_in_progress = False
         self.btn_shopee_claim.setEnabled(True)
         self.btn_shopee_claim.setText("📥 Lấy SP từ Database & Sinh Prompt")
         self.lbl_shopee_status.setText(f"Lỗi: {err_msg}")
         self.log(f"[Shopee DB] ❌ {err_msg}")
+        if auto:
+            self._schedule_auto_refill_retry("Lấy SP bị lỗi.")
+            return
         QMessageBox.warning(self, "Lỗi Shopee Database", err_msg)
 
     def release_shopee_stuck_gui(self):
@@ -3452,7 +3653,13 @@ class VeoLiteApp(QMainWindow):
 
         def on_done(count):
             self.log(f"[Shopee DB] ✅ Đã giải phóng {count} SP kẹt thành công!")
-            self.lbl_shopee_status.setText(f"Đã giải phóng {count} SP kẹt.")
+            # SP đã được trả về Database => danh sách trên bảng không còn hợp lệ, xóa trắng
+            cleared = self.tbl_i2v.rowCount()
+            self.tbl_i2v.setRowCount(0)
+            self.task_shopee_map.clear()
+            self._task_row_cache.clear()
+            self.log(f"[Shopee DB] 🧹 Đã xóa trắng danh sách ({cleared} dòng).")
+            self.lbl_shopee_status.setText(f"Đã giải phóng {count} SP kẹt và xóa trắng danh sách.")
             self.btn_shopee_release.setEnabled(True)
             self.btn_shopee_release.setText("🔄 Giải phóng SP kẹt")
 
@@ -3507,10 +3714,25 @@ class VeoLiteApp(QMainWindow):
         self.tbl_i2v.setColumnWidth(6, 100)
         self.tbl_i2v.horizontalHeader().setSectionResizeMode(6, QHeaderView.Interactive)
         self.tbl_i2v.cellDoubleClicked.connect(self.handle_i2v_double_click)
-        layout.addWidget(self.tbl_i2v)
+
+        # Bảng sản phẩm (trái) + nhật ký (phải) cạnh nhau, độ rộng 50/50
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+        splitter.addWidget(self.tbl_i2v)
+        splitter.addWidget(self.log_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([500, 500])
+        self.main_splitter = splitter
+        self._splitter_ratio_applied = False
+        self._splitter_user_moved = False
+        splitter.splitterMoved.connect(lambda *_a: setattr(self, "_splitter_user_moved", True))
+        splitter.installEventFilter(self)
+        layout.addWidget(splitter, 1)
         
         # Buttons
-        btn_layout = QHBoxLayout()
+        btn_layout = FlowLayout()
         btn_add = QPushButton("Thêm dòng")
         btn_add.clicked.connect(self.add_i2v_row)
         btn_layout.addWidget(btn_add)
@@ -3538,6 +3760,12 @@ class VeoLiteApp(QMainWindow):
         btn_csv = QPushButton("Nhập từ CSV/TXT")
         btn_csv.clicked.connect(self.import_i2v_csv)
         btn_layout.addWidget(btn_csv)
+
+        btn_import_link = QPushButton("🔗 Import Link")
+        btn_import_link.setToolTip("Nhập link Shopee (dán hoặc từ file TXT). Ảnh & tên SP tự động cào/tải khi chạy để tạo video.")
+        btn_import_link.setStyleSheet("background-color: #EE4D2D; color: #FFFFFF; font-weight: bold; border-radius: 4px; padding: 4px 10px;")
+        btn_import_link.clicked.connect(self.import_shopee_links)
+        btn_layout.addWidget(btn_import_link)
         
         btn_clear = QPushButton("Xóa tất cả")
         btn_clear.clicked.connect(self.clear_i2v_table)
@@ -3616,6 +3844,19 @@ class VeoLiteApp(QMainWindow):
         path = QFileDialog.getExistingDirectory(self, "Chọn thư mục đầu ra", self.txt_output.text())
         if path:
             self.txt_output.setText(path)
+
+    def open_output_dir(self):
+        """Mở thư mục lưu video trong Windows Explorer (tự tạo nếu chưa có)."""
+        path = self.txt_output.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Thiếu thư mục lưu", "Chưa chọn thư mục lưu video.")
+            return
+        path = os.path.normpath(path)
+        try:
+            os.makedirs(path, exist_ok=True)
+            os.startfile(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Lỗi", f"Không mở được thư mục:\n{path}\n\n{e}")
 
     # I2V operations
     def get_item_path(self, item):
@@ -4040,6 +4281,130 @@ class VeoLiteApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "Lỗi", f"Không thể đọc file: {e}")
 
+    def import_shopee_links(self):
+        """Import link Shopee (dán trực tiếp hoặc từ file TXT). Ảnh & tên SP được cào/tải khi tới lượt chạy."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import Link Shopee")
+        dlg.resize(640, 420)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel("Dán link Shopee (mỗi dòng một link) hoặc nạp từ file TXT.\n"
+                             "Ảnh & tên sản phẩm sẽ tự động cào/tải khi tới lượt tạo video:"))
+        txt = QPlainTextEdit()
+        txt.setPlaceholderText("https://shopee.vn/ten-san-pham-i.12345678.9876543210\nhttps://shopee.ph/product/12345678/9876543210\nhttps://vn.shp.ee/abcdEF")
+        lay.addWidget(txt)
+
+        row = QHBoxLayout()
+        btn_file = QPushButton("📂 Nạp từ file TXT...")
+        lbl_count = QLabel("0 link")
+        lbl_count.setStyleSheet("color: #00F0FF; font-weight: bold;")
+        row.addWidget(btn_file)
+        row.addStretch()
+        row.addWidget(lbl_count)
+        lay.addLayout(row)
+
+        def refresh_count():
+            lbl_count.setText(f"{len(shopee_link_helper.extract_links(txt.toPlainText()))} link")
+        txt.textChanged.connect(refresh_count)
+
+        def load_file():
+            path, _ = QFileDialog.getOpenFileName(dlg, "Chọn file TXT chứa link Shopee", "", "Text (*.txt);;All files (*.*)")
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception as e:
+                QMessageBox.critical(dlg, "Lỗi", f"Không đọc được file: {e}")
+                return
+            cur = txt.toPlainText().strip()
+            txt.setPlainText((cur + "\n" if cur else "") + content.strip())
+        btn_file.clicked.connect(load_file)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        btn_ok = QPushButton("Thêm vào danh sách")
+        btn_ok.setStyleSheet("background-color: #00F0FF; color: #0B0B12; font-weight: bold; padding: 6px 14px; border-radius: 4px;")
+        btn_cancel = QPushButton("Hủy")
+        btn_ok.clicked.connect(dlg.accept)
+        btn_cancel.clicked.connect(dlg.reject)
+        btns.addWidget(btn_ok)
+        btns.addWidget(btn_cancel)
+        lay.addLayout(btns)
+
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        links = shopee_link_helper.extract_links(txt.toPlainText())
+        if not links:
+            QMessageBox.information(self, "Không có link", "Không tìm thấy link Shopee hợp lệ trong nội dung đã nhập.")
+            return
+
+        # Bỏ link đã có trong bảng
+        existing = set()
+        for r in range(self.tbl_i2v.rowCount()):
+            it0 = self.tbl_i2v.item(r, 0)
+            meta = it0.data(Qt.UserRole + 1) if it0 else None
+            if isinstance(meta, dict) and meta.get("link"):
+                existing.add(meta["link"])
+        new_links = [u for u in links if u not in existing]
+        skipped = len(links) - len(new_links)
+        if not new_links:
+            QMessageBox.information(self, "Trùng link", "Tất cả link đã có sẵn trong danh sách.")
+            return
+
+        ar_choice = "9:16"
+        if hasattr(self, 'combo_aspect'):
+            txt_ar = self.combo_aspect.currentText()
+            if "16:9" in txt_ar:
+                ar_choice = "16:9"
+            elif "1:1" in txt_ar:
+                ar_choice = "1:1"
+
+        self.tbl_i2v.setUpdatesEnabled(False)
+        self.tbl_i2v.setSortingEnabled(False)
+        start_row = self.tbl_i2v.rowCount()
+        self.tbl_i2v.setRowCount(start_row + len(new_links))
+        for i, url in enumerate(new_links):
+            row = start_row + i
+            info = shopee_link_helper.parse_link(url)
+            market = info["market"]
+            item_id = info["item_id"]
+            meta = {
+                "link": url,
+                "link_item_id": item_id,
+                "market": market,
+                "name": "",
+                "image_url": "",
+                "is_lazy_shopee": True,
+                "is_link": True,
+            }
+            item_select = QTableWidgetItem()
+            item_select.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+            item_select.setCheckState(Qt.Checked)
+            item_select.setData(Qt.UserRole + 1, meta)
+            self.tbl_i2v.setItem(row, 0, item_select)
+            self.tbl_i2v.setItem(row, 1, QTableWidgetItem(str(row + 1)))
+
+            img_label = f"[Link] {market + '_' if market else ''}{item_id}.jpg" if item_id else "[Link] (ảnh tải khi chạy)"
+            img_item = QTableWidgetItem(img_label)
+            img_item.setToolTip(f"Link: {url}\n(Ảnh & tên SP sẽ tự động cào/tải khi tới lượt tạo video)")
+            self.tbl_i2v.setItem(row, 2, img_item)
+
+            prompt_item = QTableWidgetItem(f"[Link {market}] {url}" if market else f"[Link] {url}")
+            prompt_item.setToolTip(url)
+            self.tbl_i2v.setItem(row, 3, prompt_item)
+            self.tbl_i2v.setItem(row, 4, QTableWidgetItem(ar_choice))
+            self.tbl_i2v.setItem(row, 5, QTableWidgetItem("Chờ"))
+            new_task_id = str(uuid.uuid4())
+            self.tbl_i2v.setItem(row, 6, QTableWidgetItem(new_task_id))
+            self.task_shopee_map[new_task_id] = dict(meta)
+        self.tbl_i2v.setUpdatesEnabled(True)
+
+        msg = f"[Import Link] Đã thêm {len(new_links)} link Shopee vào danh sách (ảnh & tên SP sẽ tự cào khi chạy)."
+        if skipped:
+            msg += f" Bỏ qua {skipped} link trùng."
+        self.log(msg)
+
     def clear_i2v_table(self):
         self.tbl_i2v.setRowCount(0)
 
@@ -4119,6 +4484,7 @@ class VeoLiteApp(QMainWindow):
                 pass
 
     def start_queue(self):
+        self._auto_refill_timer.stop()
         tasks = []
         dur_choice = 8
         if hasattr(self, 'combo_duration'):
@@ -4127,8 +4493,6 @@ class VeoLiteApp(QMainWindow):
                 dur_choice = 16
             elif "24" in dt:
                 dur_choice = 24
-            elif "5" in dt:
-                dur_choice = 5
             else:
                 dur_choice = 8
         
@@ -4170,16 +4534,16 @@ class VeoLiteApp(QMainWindow):
                     s_mkt = ""
                     s_url = ""
                     s_name = ""
-                    if isinstance(shopee_meta, dict):
-                        s_id = shopee_meta.get("item_id", "")
-                        s_mkt = shopee_meta.get("market", "")
-                        s_url = shopee_meta.get("image_url", "")
-                        s_name = shopee_meta.get("name", "")
-                    elif task_id_val in self.task_shopee_map:
-                        s_id = self.task_shopee_map[task_id_val].get("item_id", "")
-                        s_mkt = self.task_shopee_map[task_id_val].get("market", "")
-                        s_url = self.task_shopee_map[task_id_val].get("image_url", "")
-                        s_name = self.task_shopee_map[task_id_val].get("name", "")
+                    s_link = ""
+                    s_link_id = ""
+                    _meta_src = shopee_meta if isinstance(shopee_meta, dict) else self.task_shopee_map.get(task_id_val)
+                    if isinstance(_meta_src, dict):
+                        s_id = _meta_src.get("item_id", "")
+                        s_mkt = _meta_src.get("market", "")
+                        s_url = _meta_src.get("image_url", "")
+                        s_name = _meta_src.get("name", "")
+                        s_link = _meta_src.get("link", "")
+                        s_link_id = _meta_src.get("link_item_id", "")
 
                     cur_scene = self.combo_scene.currentText() if hasattr(self, 'combo_scene') else "🎲 Random"
                     cur_style = self.combo_review_style.currentText() if hasattr(self, 'combo_review_style') else "🎲 Random"
@@ -4202,6 +4566,8 @@ class VeoLiteApp(QMainWindow):
                         "shopee_market": s_mkt,
                         "shopee_image_url": s_url,
                         "shopee_name": s_name,
+                        "shopee_link": s_link,
+                        "link_item_id": s_link_id,
                         "shopee_scene": cur_scene,
                         "shopee_style": cur_style,
                         "shopee_prompt_mode": cur_prompt_mode
@@ -4216,6 +4582,10 @@ class VeoLiteApp(QMainWindow):
             self.log(f"[Hệ thống] Bỏ qua {len(missing_img_rows)} dòng không tìm thấy ảnh nguồn: {preview}{more}")
 
         if not tasks:
+            if getattr(self, "_auto_starting", False):
+                # Chạy tự động: không bật hộp thoại chặn, chờ rồi lấy lại SP
+                self._schedule_auto_refill_retry("Không có tác vụ hợp lệ để chạy.")
+                return
             msg = "Không có tác vụ nào được chọn hoặc cần xử lý!"
             if missing_img_rows:
                 msg += f"\n\n{len(missing_img_rows)} dòng đã chọn bị bỏ qua vì không tìm thấy ảnh nguồn (xem log)."
@@ -4253,6 +4623,9 @@ class VeoLiteApp(QMainWindow):
         self.metric_timer.start()
         self.progress_total.setFormat(f"Tiến độ tổng: 0% (Thành công: 0/{self.total_tasks_count})")
         
+        # Tự động nạp danh sách tài khoản mới nhất từ đĩa
+        self.load_accounts_pool()
+        
         # Start Thread
         self.worker = WorkerThread(
             self.client, 
@@ -4276,12 +4649,30 @@ class VeoLiteApp(QMainWindow):
         self.worker.start()
 
     def stop_queue(self):
-        self.metric_timer.stop()
-        if hasattr(self, 'worker') and self.worker:
-            self.worker.request_stop()
-            self.btn_stop.setText("⏳ Đang đợi hoàn thành...")
+        auto_waiting = self._auto_refill_timer.isActive() or self._auto_refill_in_progress
+        self._cancel_auto_refill()
+        worker_running = bool(getattr(self, 'worker', None) and self.worker.isRunning())
+        if auto_waiting and not worker_running:
+            self.log("[Tự động] Đã dừng chế độ tự động lấy SP.")
+            self.lbl_shopee_status.setText("Đã dừng chế độ tự động.")
             self.btn_stop.setEnabled(False)
-            self.log("[Hệ thống] Nhận yêu cầu dừng: Không nhận thêm tác vụ mới, đang hoàn thành nốt các video đang xử lý dở...")
+            self.btn_stop.setText("⏹ Dừng lại")
+            return
+        self.metric_timer.stop()
+        worker = getattr(self, 'worker', None)
+        if worker and worker.isRunning():
+            if worker.stop_requested:
+                # Lần bấm thứ 2: dừng ngay, hủy luôn các job đang chạy dở
+                worker.stop()
+                self.btn_stop.setText("⏳ Đang dừng ngay...")
+                self.btn_stop.setEnabled(False)
+                self.log("[Hệ thống] ⛔ Dừng ngay: đang hủy toàn bộ các video đang xử lý dở...")
+                return
+            # Lần bấm thứ 1: ngừng nhận job mới, chờ các job đang dở chạy xong
+            worker.request_stop()
+            self.btn_stop.setText("⏳ Đang đợi hoàn thành... (bấm lần nữa để dừng ngay)")
+            self.btn_stop.setEnabled(True)
+            self.log("[Hệ thống] Nhận yêu cầu dừng: Không nhận thêm tác vụ mới, đang hoàn thành nốt các video đang xử lý dở... (bấm 'Dừng' thêm lần nữa để dừng ngay)")
 
 
 
@@ -4374,7 +4765,10 @@ class VeoLiteApp(QMainWindow):
         self.progress_total.setFormat(f"Tiến độ tổng: 100% (Thành công: {self.successful_tasks_count}/{self.total_tasks_count})")
         
         stopped_by_user = getattr(self.worker, 'stop_requested', False) if hasattr(self, 'worker') and self.worker else False
-        if stopped_by_user:
+        force_stopped = getattr(self.worker, 'force_stopped', False) if hasattr(self, 'worker') and self.worker else False
+        if force_stopped:
+            self.log("[Hệ thống] ⛔ Đã dừng ngay theo yêu cầu. Các video đang chạy dở bị ngắt (đánh dấu 'Đã dừng', sẽ chạy lại ở lần sau).")
+        elif stopped_by_user:
             self.log("[Hệ thống] Đã dừng hàng chờ theo yêu cầu người dùng. Toàn bộ tác vụ đang chạy đã hoàn tất.")
         else:
             self.log("Hoàn thành xử lý hàng chờ.")
@@ -4389,6 +4783,13 @@ class VeoLiteApp(QMainWindow):
         if stopped_by_user:
             return
 
+        # Chế độ chạy liên tục: hết SP thì tự lấy lô mới từ Database rồi chạy tiếp (không hỏi lại).
+        # Các dòng lỗi còn lại sẽ được chạy lại cùng lô mới.
+        if self.chk_auto_refill.isChecked():
+            self.log(f"[Tự động] Hết hàng chờ (còn {remaining_rows} dòng lỗi/chưa xong). Đang lấy thêm SP từ Database...")
+            self.auto_refill_and_run()
+            return
+
         if remaining_rows > 0:
             dialog = CountdownMessageBox(self, timeout_seconds=20)
             if dialog.exec() == QDialog.Accepted:
@@ -4398,6 +4799,46 @@ class VeoLiteApp(QMainWindow):
                 self.log("Người dùng từ chối chạy lại các lệnh lỗi.")
         else:
             QMessageBox.information(self, "Hoàn thành", "Đã xử lý xong hàng chờ! Tất cả video đã tạo thành công.")
+
+    # ==================== CHẠY LIÊN TỤC: TỰ LẤY SP KHI HẾT ====================
+    def auto_refill_and_run(self):
+        """Lấy lô SP mới từ Database (theo đúng bộ lọc đang chọn) rồi tự chạy queue."""
+        if not self.chk_auto_refill.isChecked():
+            return
+        if self.shopee_claim_worker is not None and self.shopee_claim_worker.isRunning():
+            return
+        self._auto_refill_timer.stop()
+        self._auto_refill_in_progress = True
+        # Cho phép người dùng dừng chế độ tự động trong lúc đang lấy SP / chờ thử lại
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("⏹ Dừng tự động")
+        self.start_shopee_claim_gui()
+
+    def _schedule_auto_refill_retry(self, reason):
+        """Database tạm thời hết SP hoặc lỗi mạng: chờ một lúc rồi thử lấy lại."""
+        self._auto_refill_in_progress = False
+        if not self.chk_auto_refill.isChecked():
+            self.btn_stop.setEnabled(False)
+            self.btn_stop.setText("⏹ Dừng lại")
+            return
+        sec = self.AUTO_REFILL_RETRY_SECONDS
+        self.log(f"[Tự động] {reason} Sẽ thử lấy lại sau {sec} giây (bấm 'Dừng tự động' để thoát)...")
+        self.lbl_shopee_status.setText(f"Tự động: chờ {sec}s rồi lấy lại SP...")
+        self.btn_stop.setEnabled(True)
+        self.btn_stop.setText("⏹ Dừng tự động")
+        self._auto_refill_timer.start(sec * 1000)
+
+    def _cancel_auto_refill(self):
+        self._auto_refill_timer.stop()
+        self._auto_refill_in_progress = False
+
+    def _auto_run_queue(self):
+        """Chạy queue ngay sau khi tự nạp SP; nếu không có tác vụ hợp lệ thì chờ rồi lấy lại."""
+        self._auto_starting = True
+        try:
+            self.start_queue()
+        finally:
+            self._auto_starting = False
 
     def find_row_by_task_id(self, task_id):
         # Thử vị trí đã biết trước; dòng có thể đã bị xóa/dịch chuyển nên luôn kiểm tra lại Task ID
@@ -4422,6 +4863,29 @@ class VeoLiteApp(QMainWindow):
                 self._task_row_cache[task_id] = (r, "se")
                 return r, "se"
         return -1, ""
+
+    def eventFilter(self, obj, event):
+        if (obj is getattr(self, "main_splitter", None)
+                and event.type() == QEvent.Resize
+                and not getattr(self, "_splitter_user_moved", False)):
+            QTimer.singleShot(0, self._apply_splitter_ratio)
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not getattr(self, "_splitter_ratio_applied", True):
+            self._splitter_ratio_applied = True
+            QTimer.singleShot(0, self._apply_splitter_ratio)
+
+    def _apply_splitter_ratio(self):
+        """Chia 2 cột: bảng sản phẩm 50% - nhật ký 50%."""
+        sp = getattr(self, "main_splitter", None)
+        if sp is None:
+            return
+        total = sp.width() - sp.handleWidth()
+        if total > 0:
+            left = total // 2
+            sp.setSizes([left, total - left])
 
     def closeEvent(self, event):
         self.save_all_settings()
@@ -4481,11 +4945,21 @@ class VeoLiteApp(QMainWindow):
                 shopee_market = ""
                 shopee_name = ""
                 shopee_image_url = ""
+                shopee_link = ""
+                link_item_id = ""
                 if isinstance(meta, dict):
                     shopee_item_id = meta.get("item_id", "")
                     shopee_market = meta.get("market", "")
                     shopee_name = meta.get("name", "")
                     shopee_image_url = meta.get("image_url", "")
+                    shopee_link = meta.get("link", "")
+                    link_item_id = meta.get("link_item_id", "")
+
+                # SP từ Database sẽ bị giải phóng khi đóng app => không lưu sang phiên sau.
+                # Dòng mẫu chưa chọn ảnh cũng không lưu (không dùng được, chỉ làm bảng phình thêm dòng thừa).
+                if (shopee_item_id or str(img).startswith("[Shopee]")
+                        or str(img).strip() in ("", "Nháy đúp để chọn ảnh...")):
+                    continue
 
                 i2v_rows.append({
                     "start_image": img,
@@ -4497,7 +4971,9 @@ class VeoLiteApp(QMainWindow):
                     "shopee_item_id": shopee_item_id,
                     "shopee_market": shopee_market,
                     "shopee_name": shopee_name,
-                    "shopee_image_url": shopee_image_url
+                    "shopee_image_url": shopee_image_url,
+                    "shopee_link": shopee_link,
+                    "link_item_id": link_item_id
                 })
 
             # Table 2: Start/End
@@ -4519,7 +4995,6 @@ class VeoLiteApp(QMainWindow):
 
     def load_session(self):
         if not os.path.exists("veo3_session.json"):
-            self.add_i2v_row()
             return
             
         try:
@@ -4544,7 +5019,14 @@ class VeoLiteApp(QMainWindow):
             # Các tuỳ chọn Shopee đã được nạp từ shopee_db_settings.json lúc dựng giao diện
 
             # Load I2V Table: cấp phát đủ số dòng một lần (insertRow từng dòng rất chậm với hàng nghìn dòng)
-            i2v_rows = session_data.get("i2v", [])
+            # Dòng mẫu chưa chọn ảnh không có giá trị sử dụng (start_queue cũng bỏ qua), không khôi phục
+            # để mỗi lần mở không bị cộng thêm dòng mẫu thừa.
+            i2v_rows = [
+                rd for rd in session_data.get("i2v", [])
+                if not rd.get("shopee_item_id")
+                and not str(rd.get("start_image", "")).startswith("[Shopee]")
+                and str(rd.get("start_image", "")).strip() not in ("", "Nháy đúp để chọn ảnh...")
+            ]
             self.tbl_i2v.setUpdatesEnabled(False)
             self.tbl_i2v.setSortingEnabled(False)
             self.tbl_i2v.setRowCount(0)
@@ -4579,6 +5061,19 @@ class VeoLiteApp(QMainWindow):
                     self.task_shopee_map[task_id_new] = dict(meta)
                     if not image_url and start_image.startswith("[Shopee]"):
                         status_str = "Lỗi: Thiếu URL ảnh (lấy lại SP từ DB)"
+                elif row_data.get("shopee_link"):
+                    # Dòng Import Link: ảnh & tên SP sẽ được cào từ link khi tới lượt chạy
+                    meta = {
+                        "link": row_data["shopee_link"],
+                        "link_item_id": row_data.get("link_item_id", ""),
+                        "market": row_data.get("shopee_market", ""),
+                        "name": row_data.get("shopee_name", ""),
+                        "image_url": "",
+                        "is_lazy_shopee": True,
+                        "is_link": True,
+                    }
+                    item_select.setData(Qt.UserRole + 1, meta)
+                    self.task_shopee_map[task_id_new] = dict(meta)
 
                 self.tbl_i2v.setItem(r, 0, item_select)
 
@@ -4595,13 +5090,9 @@ class VeoLiteApp(QMainWindow):
 
             # Load SE Table (Disabled)
             self.tbl_se.setRowCount(0)
-                
-            if self.tbl_i2v.rowCount() == 0:
-                self.add_i2v_row()
         except Exception as e:
             print("Error loading session:", e)
             self.tbl_i2v.setUpdatesEnabled(True)
-            self.add_i2v_row()
 
 
 
@@ -4662,6 +5153,7 @@ class VeoLiteApp(QMainWindow):
         self.log(f"[Cấu hình] Đã tự động đặt {val} luồng chạy song song ({len(available_accs)} tài khoản, tổng {val} slots trong Pool).")
 
     def open_account_manager_dialog(self):
+        self.load_accounts_pool()
         dlg = AccountManagerDialog(self, self.accounts_pool, on_pool_updated=self.on_pool_updated_from_dialog)
         dlg.exec()
 
