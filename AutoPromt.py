@@ -55,6 +55,8 @@ import websockets
 import re
 import shutil
 import subprocess
+import tempfile
+import base64
 from PySide6.QtCore import QThread, Signal, QObject, Qt, Slot, QRect, QTimer, QPoint, QSize, QEvent
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QLineEdit, QPushButton, QTableWidget, QTableWidgetItem,
