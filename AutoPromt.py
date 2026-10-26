@@ -517,7 +517,7 @@ class DailyLimitExceeded(Exception):
 # vì vậy các sản phẩm này cần được loại khỏi hàng chờ thay vì chạy lại.
 VEO_CONTENT_ERRORS = {
     "PUBLIC_ERROR_IP_INPUT_IMAGE": "Lỗi Bản Quyền",
-    "PROMINENT_PEOPLE": "Lỗi Bản Quyền",
+    "PROMINENT_PEOPLE": "Gương Mặt Nổi Tiếng (CS)",
     "FILTER_FAILED": "Lỗi Bản Quyền",
     "PUBLIC_ERROR_RECITATION": "Lỗi Bản Quyền",
     "PUBLIC_ERROR_UNSAFE_GENERATION": "Lỗi Bộ lọc nội dung",
