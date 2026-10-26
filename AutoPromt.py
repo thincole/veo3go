@@ -78,6 +78,7 @@ from shopee_db_helper import (
     DEFAULT_SETTINGS as SHOPEE_DEFAULT_SETTINGS
 )
 import shopee_link_helper
+from prompt_segments_helper import build_segment_prompts, concat_videos
 
 
 import threading
@@ -829,8 +830,21 @@ class TestPromptDialog(QDialog):
             "Tiếng Anh": "SG"
         }
         mkt = mkt_map.get(self.lang, "PH")
-        p, tag = build_tvc_prompt(self.product_name, market=mkt, review_style=self.review_style, scene_choice=self.scene)
-        self.txt_prompt.setText(f"[Tag: {tag}]\n\n{p}")
+        dur_str = self.settings.get("seedvis_total_dur", "8s")
+        dur_val = 16 if "16" in str(dur_str) else (24 if "24" in str(dur_str) else 8)
+        if dur_val > 8:
+            prompts = build_segment_prompts(
+                self.product_name, market=mkt, duration_sec=dur_val,
+                review_style=self.review_style, scene_choice=self.scene,
+                prompt_mode=self.ai_mode
+            )
+            body = f"[Thời lượng: {dur_val}s ({len(prompts)} phân đoạn) | Chế độ: {self.ai_mode}]\n\n"
+            for s_idx, sp in enumerate(prompts):
+                body += f"=== PHÂN ĐOẠN {s_idx + 1} (8s) ===\n{sp}\n\n"
+            self.txt_prompt.setText(body.strip())
+        else:
+            p, tag = build_tvc_prompt(self.product_name, market=mkt, review_style=self.review_style, scene_choice=self.scene)
+            self.txt_prompt.setText(f"[Tag: {tag}]\n\n{p}")
 
     def copy_prompt(self):
         clipboard = QApplication.clipboard()
@@ -1488,27 +1502,41 @@ class WorkerThread(QThread):
                             break
                     task["start_image"] = img_path
 
-                    # 2. Sinh Prompt TVC on-demand
+                    # 2. Sinh Prompt TVC on-demand (Hỗ trợ đa phân đoạn cho 16s/24s)
                     if not task.get("prompt_ready"):
                         self.progress_signal.emit(task_id, 4, "Đang tạo Prompt TVC...")
                         scene_c = task.get("shopee_scene", "🎲 Random")
                         style_c = task.get("shopee_style", "🎲 Random")
+                        dur_sec = task.get("duration_seconds", 8)
+                        p_mode = task.get("shopee_prompt_mode", "Prompt A + B")
                         
                         def do_prompt():
                             try:
+                                return build_segment_prompts(
+                                    product_name=s_name,
+                                    market=s_mkt,
+                                    duration_sec=dur_sec,
+                                    review_style=style_c,
+                                    scene_choice=scene_c,
+                                    prompt_mode=p_mode
+                                )
+                            except Exception as e:
                                 p_res, _ = build_tvc_prompt(
                                     product_name=s_name,
                                     market=s_mkt,
                                     review_style=style_c,
                                     scene_choice=scene_c
                                 )
-                                return p_res
-                            except Exception as e:
-                                return str(e)
-                        gen_prompt = await asyncio.to_thread(do_prompt)
-                        task["prompt"] = gen_prompt
+                                return [p_res]
+
+                        seg_prompts = await asyncio.to_thread(do_prompt)
+                        task["segment_prompts"] = seg_prompts
+                        if len(seg_prompts) > 1:
+                            task["prompt"] = "\n\n--- SEGMENT 2 ---\n\n".join(seg_prompts)
+                        else:
+                            task["prompt"] = seg_prompts[0]
                         task["prompt_ready"] = True
-                        self.log_signal.emit(f"[{task_id}] [Shopee DB] Đã tạo Prompt TVC: {gen_prompt[:65]}...")
+                        self.log_signal.emit(f"[{task_id}] [Shopee DB] Đã tạo {len(seg_prompts)} đoạn Prompt ({p_mode}, {dur_sec}s): {seg_prompts[0][:65]}...")
 
                     # 3. Đồng bộ hóa đường dẫn ảnh & Prompt lên giao diện
                     self.task_updated_signal.emit(task_id, task["start_image"], task["prompt"])
@@ -1606,262 +1634,351 @@ class WorkerThread(QThread):
         task_id = task["task_id"]
         await session.ensure_connected()
 
-        # Tạo queue nhận message cho riêng task_id này
-        q = asyncio.Queue()
-        session.task_events[task_id] = q
+        aspect_map = {
+            "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
+            "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE"
+        }
+        mapped_ar = aspect_map.get(task.get("aspect_ratio", "9:16"), task.get("aspect_ratio", "VIDEO_ASPECT_RATIO_PORTRAIT"))
+        dur_sec = task.get("duration_seconds") or task.get("duration_sec") or 8
+
+        # 1. Xác định danh sách prompts cho các phân đoạn (segments)
+        prompts = task.get("segment_prompts")
+        if not prompts:
+            raw_p = task.get("prompt", "")
+            if "--- SEGMENT 2 ---" in raw_p:
+                prompts = [p.strip() for p in raw_p.split("--- SEGMENT 2 ---") if p.strip()]
+            elif "\n---\n" in raw_p:
+                prompts = [p.strip() for p in raw_p.split("\n---\n") if p.strip()]
+            elif dur_sec >= 16:
+                p_name = task.get("shopee_name") or raw_p or "product"
+                prompts = build_segment_prompts(
+                    product_name=p_name,
+                    market=task.get("shopee_market", "PH"),
+                    duration_sec=dur_sec,
+                    review_style=task.get("shopee_style", "🎲 Random"),
+                    scene_choice=task.get("shopee_scene", "🎲 Random"),
+                    prompt_mode=task.get("shopee_prompt_mode", "Prompt A + B")
+                )
+            else:
+                prompts = [raw_p] if raw_p else []
+
+        if not prompts:
+            p_name = task.get("shopee_name") or "product"
+            prompts = build_segment_prompts(product_name=p_name, market=task.get("shopee_market", "PH"), duration_sec=dur_sec)
+
+        n_segments = len(prompts)
+        if dur_sec >= 16 and n_segments == 1:
+            p_name = task.get("shopee_name") or task.get("prompt", "") or "product"
+            prompts = build_segment_prompts(product_name=p_name, market=task.get("shopee_market", "PH"), duration_sec=dur_sec)
+            n_segments = len(prompts)
+
+        # 2. Đọc ảnh nguồn base64
+        s_b64 = None
+        e_b64 = None
+        if task.get("start_image") and os.path.exists(task["start_image"]):
+            s_b64 = await asyncio.to_thread(encode_image_base64, task["start_image"])
+        if not s_b64:
+            self.task_done_signal.emit(task_id, "", "Lỗi đọc ảnh nguồn")
+            return False
+
+        if task["mode"] == "start_end":
+            if task.get("end_image") and os.path.exists(task["end_image"]):
+                e_b64 = await asyncio.to_thread(encode_image_base64, task["end_image"])
+            if not e_b64:
+                self.task_done_signal.emit(task_id, "", "Lỗi đọc ảnh đầu/cuối")
+                return False
+
+        temp_dir = os.path.join(tempfile.gettempdir(), f"veo3_task_{uuid.uuid4().hex[:8]}")
+        os.makedirs(temp_dir, exist_ok=True)
+        clip_paths = []
 
         try:
-            self.log_signal.emit(f"[{task_id}] Đang tải ảnh lên và gửi yêu cầu...")
-            self.progress_signal.emit(task_id, 10, "Đang gửi dữ liệu...")
-            
-            # Prepare payload
-            aspect_map = {
-                "9:16": "VIDEO_ASPECT_RATIO_PORTRAIT",
-                "16:9": "VIDEO_ASPECT_RATIO_LANDSCAPE"
-            }
-            mapped_ar = aspect_map.get(task.get("aspect_ratio", "9:16"), task.get("aspect_ratio", "VIDEO_ASPECT_RATIO_PORTRAIT"))
-            dur_sec = task.get("duration_seconds") or task.get("duration_sec") or 8
-
-            if task["mode"] == "image_to_video":
-                s_b64 = await asyncio.to_thread(encode_image_base64, task["start_image"])
-                if not s_b64:
-                    self.task_done_signal.emit(task_id, "", "Lỗi đọc ảnh nguồn")
+            # 3. Lặp render từng phân đoạn (mỗi segment dài 8s)
+            for seg_idx, cur_seg_prompt in enumerate(prompts):
+                if not self.is_running or self.stop_requested:
                     return False
-                
-                payload = {
-                    "event": "submit_image_video_batch",
-                    "data": [
-                        {
-                            "task_id": task_id,
-                            "image_base64": s_b64,
+
+                seg_num = seg_idx + 1
+                seg_label = f"Segment {seg_num}/{n_segments} (8s)" if n_segments > 1 else f"video ({dur_sec}s)"
+                self.log_signal.emit(f"[{task_id}] 🎬 Bắt đầu tạo {seg_label}...")
+
+                seg_task_id = str(uuid.uuid4())
+                q = asyncio.Queue()
+                session.task_events[seg_task_id] = q
+
+                try:
+                    base_pct = 5 + int((seg_idx / n_segments) * 80)
+                    self.progress_signal.emit(task_id, base_pct, f"Đang gửi {seg_label}...")
+
+                    if task["mode"] == "image_to_video":
+                        payload = {
+                            "event": "submit_image_video_batch",
+                            "data": [
+                                {
+                                    "task_id": seg_task_id,
+                                    "image_base64": s_b64,
+                                    "mime_type": "image/jpeg",
+                                    "prompt": cur_seg_prompt,
+                                    "aspect_ratio": mapped_ar,
+                                    "seed": task.get("seed", 0),
+                                    "upscale_1080p": task.get("upscale_1080p", False),
+                                    "duration_seconds": 8,
+                                    "allow_silent_video": task.get("allow_silent", True)
+                                }
+                            ]
+                        }
+                    else:
+                        data_item = {
+                            "task_id": seg_task_id,
+                            "start_image_base64": s_b64,
+                            "end_image_base64": e_b64,
                             "mime_type": "image/jpeg",
-                            "prompt": task.get("prompt", ""),
+                            "prompt": cur_seg_prompt,
                             "aspect_ratio": mapped_ar,
                             "seed": task.get("seed", 0),
                             "upscale_1080p": task.get("upscale_1080p", False),
-                            "duration_seconds": dur_sec,
+                            "duration_seconds": 8,
                             "allow_silent_video": task.get("allow_silent", True)
                         }
-                    ]
-                }
-            else: # start_end
-                s_b64 = await asyncio.to_thread(encode_image_base64, task["start_image"])
-                e_b64 = await asyncio.to_thread(encode_image_base64, task["end_image"])
-                if not s_b64 or not e_b64:
-                    self.task_done_signal.emit(task_id, "", "Lỗi đọc ảnh đầu/cuối")
+                        if task.get("motion_prompt"):
+                            data_item["motion_prompt"] = task["motion_prompt"]
+                        if task.get("camera_prompt"):
+                            data_item["camera_prompt"] = task["camera_prompt"]
+                        payload = {
+                            "event": "submit_start_end_video_batch",
+                            "data": [data_item]
+                        }
+
+                    await session.send_json(payload)
+                    self.log_signal.emit(f"[{task_id}] Đã gửi {seg_label} lên Server Veo.")
+
+                    # Chờ kết quả cho segment này
+                    seg_done = False
+                    seg_out_path = os.path.join(temp_dir, f"clip_seg_{seg_idx}.mp4")
+
+                    while self.is_running and not self.stop_requested:
+                        try:
+                            event, data = await asyncio.wait_for(q.get(), timeout=900)
+                        except asyncio.TimeoutError:
+                            self.log_signal.emit(f"[{task_id}] Hết thời gian chờ {seg_label} (15 phút). Trả SP về pending...")
+                            await self.release_shopee_task(task, f"Timeout chờ {seg_label}")
+                            self.task_done_signal.emit(task_id, "", f"Lỗi: Timeout chờ {seg_label}")
+                            return False
+
+                        if event == "ws_closed":
+                            raise Exception(data.get("error", "Kết nối WebSocket bị ngắt"))
+
+                        if event in ("video_queued", "queued"):
+                            pos = data.get("queue_position", 1)
+                            self.progress_signal.emit(task_id, base_pct + 2, f"Hàng chờ {seg_label}: #{pos}")
+                            self.log_signal.emit(f"[{task_id}] Vị trí hàng chờ {seg_label}: #{pos}")
+                        elif event in ("video_processing", "progress", "job_processing"):
+                            progress_val = data.get("progress", 0)
+                            seg_pct = base_pct + int((progress_val / 100.0) * (70 / n_segments))
+                            self.progress_signal.emit(task_id, min(90, seg_pct), f"Tạo {seg_label} ({progress_val}%)")
+                        elif event == "video_retry":
+                            self.progress_signal.emit(task_id, base_pct + 4, f"Server thử lại {seg_label}...")
+                            self.log_signal.emit(f"[{task_id}] Server gửi sự kiện video_retry cho {seg_label}...")
+                        elif event == "video_upscaling":
+                            self.progress_signal.emit(task_id, base_pct + 8, f"Upscale 1080p {seg_label}...")
+                            self.log_signal.emit(f"[{task_id}] Đang nâng cấp lên 1080p cho {seg_label}...")
+                        elif event in ("video_result", "job_result"):
+                            self.progress_signal.emit(task_id, min(92, base_pct + int(80 / n_segments)), f"Tải kết quả {seg_label}...")
+                            self.log_signal.emit(f"[{task_id}] Nhận kết quả từ server: {event} ({seg_label})")
+
+                            try:
+                                await session.send_json({"event": "result_ack", "data": {"task_id": seg_task_id}})
+                            except Exception:
+                                pass
+
+                            encoded_video = data.get("encoded_video") or data.get("inline_mp4")
+                            video_url = None
+
+                            if not encoded_video:
+                                res_raw = data.get("result")
+                                if isinstance(res_raw, dict):
+                                    encoded_video = res_raw.get("encoded_video") or res_raw.get("inline_mp4")
+                                    video_url = res_raw.get("download_url") or res_raw.get("url") or res_raw.get("video_url")
+                                    if not video_url and res_raw.get("urls"):
+                                        video_url = res_raw["urls"][0]
+                                elif isinstance(res_raw, list) and len(res_raw) > 0:
+                                    first_res = res_raw[0]
+                                    if isinstance(first_res, dict):
+                                        encoded_video = first_res.get("encoded_video") or first_res.get("inline_mp4")
+                                        video_url = first_res.get("download_url") or first_res.get("url") or first_res.get("video_url")
+                                        if not video_url and first_res.get("urls"):
+                                            video_url = first_res["urls"][0]
+                                    elif isinstance(first_res, str):
+                                        video_url = first_res
+
+                                if not video_url and not encoded_video:
+                                    video_url = data.get("download_url") or data.get("url") or data.get("video_url")
+                                    if not video_url and data.get("urls"):
+                                        video_url = data["urls"][0]
+
+                            if encoded_video:
+                                try:
+                                    import base64
+                                    video_bytes = base64.b64decode(encoded_video)
+                                    with open(seg_out_path, "wb") as out_file:
+                                        out_file.write(video_bytes)
+                                except Exception as e:
+                                    await self.report_shopee_status(task, f"Lỗi giải mã base64: {e}", "")
+                                    self.task_done_signal.emit(task_id, "", f"Lỗi giải mã base64: {e}")
+                                    return False
+                            elif video_url:
+                                self.log_signal.emit(f"[{task_id}] Đang tải {seg_label} từ: {video_url[:60]}...")
+                                try:
+                                    await asyncio.to_thread(self.download_file, video_url, seg_out_path)
+                                except Exception as e:
+                                    await self.report_shopee_status(task, f"Lỗi tải video {seg_label}: {e}", "")
+                                    self.task_done_signal.emit(task_id, "", f"Lỗi tải video: {e}")
+                                    return False
+                            else:
+                                raw_err = data.get("error") or data.get("code") or data.get("message") or ""
+                                if any(x in str(raw_err).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
+                                    raise DailyLimitExceeded()
+
+                                res_lbl, code = classify_veo_error(data)
+                                if res_lbl:
+                                    self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo {seg_label}: {code} → {res_lbl}.")
+                                    await self.report_shopee_status(task, res_lbl, "")
+                                else:
+                                    err_detail = raw_err or f"Không tìm thấy dữ liệu video cho {seg_label}"
+                                    self.log_signal.emit(f"[{task_id}] Máy chủ Veo sự cố {seg_label}: {err_detail}.")
+                                    await self.release_shopee_task(task, str(err_detail))
+                                    res_lbl = f"Lỗi server: {err_detail}"
+
+                                self.task_done_signal.emit(task_id, "", res_lbl)
+                                return False
+
+                            if os.path.exists(seg_out_path) and os.path.getsize(seg_out_path) > 10240:
+                                clip_paths.append(seg_out_path)
+                                size_kb = os.path.getsize(seg_out_path) // 1024
+                                self.log_signal.emit(f"[{task_id}] ✅ Đã hoàn tất {seg_label} ({size_kb} KB).")
+                                seg_done = True
+                                break
+                            else:
+                                self.log_signal.emit(f"[{task_id}] ❌ {seg_label}: File tải về bị rỗng hoặc lỗi")
+                                await self.release_shopee_task(task, f"File {seg_label} rỗng")
+                                self.task_done_signal.emit(task_id, "", f"Lỗi: File {seg_label} rỗng")
+                                return False
+
+                        elif event in ("error", "job_error"):
+                            err_msg = data.get("message") or data.get("detail") or data.get("reason") or data.get("error") or "Lỗi server không xác định"
+                            if any(x in str(err_msg).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
+                                raise DailyLimitExceeded()
+
+                            res_label, code = classify_veo_error(data)
+                            if res_label:
+                                self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo {seg_label}: {code} → {res_label}.")
+                                await self.report_shopee_status(task, res_label, "")
+                            else:
+                                self.log_signal.emit(f"[{task_id}] Máy chủ Veo báo lỗi ({err_msg}). Trả sản phẩm về pending...")
+                                await self.release_shopee_task(task, str(err_msg))
+                                res_label = f"Lỗi server: {err_msg}"
+
+                            self.task_done_signal.emit(task_id, "", res_label)
+                            return False
+
+                finally:
+                    session.task_events.pop(seg_task_id, None)
+
+                if not seg_done:
                     return False
-                
-                data_item = {
-                    "task_id": task_id,
-                    "start_image_base64": s_b64,
-                    "end_image_base64": e_b64,
-                    "mime_type": "image/jpeg",
-                    "prompt": task.get("prompt", ""),
-                    "aspect_ratio": mapped_ar,
-                    "seed": task.get("seed", 0),
-                    "upscale_1080p": task.get("upscale_1080p", False),
-                    "duration_seconds": dur_sec,
-                    "allow_silent_video": task.get("allow_silent", True)
-                }
-                if task.get("motion_prompt"):
-                    data_item["motion_prompt"] = task["motion_prompt"]
-                if task.get("camera_prompt"):
-                    data_item["camera_prompt"] = task["camera_prompt"]
-                    
-                payload = {
-                    "event": "submit_start_end_video_batch",
-                    "data": [data_item]
-                }
 
-            await session.send_json(payload)
-            self.log_signal.emit(f"[{task_id}] Đã gửi yêu cầu render (Thời lượng: {dur_sec}s).")
-            self.progress_signal.emit(task_id, 15, "Đang xử lý ở hàng chờ...")
+            # 4. Kiểm tra hoàn tất tất cả phân đoạn
+            if len(clip_paths) != n_segments:
+                self.log_signal.emit(f"[{task_id}] ❌ Không đủ số phân đoạn để hoàn tất ({len(clip_paths)}/{n_segments})")
+                return False
 
-            # Vòng lặp nhận kết quả cho task này
-            while self.is_running:
+            # 5. Xác định đường dẫn file đầu ra
+            img_name = "result"
+            mode_str = str(getattr(self, "naming_mode", "Theo Item ID"))
+            item_id = task.get("shopee_item_id") or task.get("link_item_id")
+            row_idx = task.get("row_index", 0) + 1
+            prompt_str = task.get("prompt", "").strip()
+
+            if ("Item ID" in mode_str) and item_id:
+                img_name = str(item_id)
+            elif ("15" in mode_str or "13" in mode_str) and prompt_str:
+                safe_prompt = re.sub(r'[\\/*?:"<>|]', '', prompt_str)
+                lim = 15 if "15" in mode_str else 13
+                img_name = safe_prompt[:lim].strip() or f"video_{task_id[:8]}"
+            elif "thứ tự" in mode_str:
+                img_name = f"{row_idx:03d}"
+            elif task.get("start_image"):
+                img_name = os.path.splitext(os.path.basename(task["start_image"]))[0]
+            elif prompt_str:
+                img_name = f"video_{slugify(prompt_str)[:20]}"
+            else:
+                img_name = f"video_{task_id[:8]}"
+
+            out_path = os.path.join(self.output_dir, f"{img_name}.mp4")
+            counter = 1
+            while os.path.exists(out_path):
+                out_path = os.path.join(self.output_dir, f"{img_name}_{counter}.mp4")
+                counter += 1
+
+            # 6. Ghép nối FFmpeg nếu có nhiều hơn 1 phân đoạn, hoặc copy nếu 1 phân đoạn
+            if n_segments > 1:
+                self.progress_signal.emit(task_id, 90, f"Đang ghép nối {n_segments} phân đoạn...")
+                self.log_signal.emit(f"[{task_id}] 🔗 Đang tự động ghép nối {n_segments} clips (tổng {dur_sec}s) bằng FFmpeg...")
+                ok_concat = await asyncio.to_thread(
+                    concat_videos,
+                    clip_paths,
+                    out_path,
+                    log=lambda m: self.log_signal.emit(f"[{task_id}] {m}")
+                )
+                if not ok_concat or not os.path.exists(out_path) or os.path.getsize(out_path) < 10240:
+                    self.log_signal.emit(f"[{task_id}] ❌ Lỗi ghép nối video bằng FFmpeg!")
+                    await self.report_shopee_status(task, "Lỗi ghép video FFmpeg", "")
+                    self.task_done_signal.emit(task_id, "", "Lỗi ghép video FFmpeg")
+                    return False
+                self.log_signal.emit(f"[{task_id}] ✅ Đã ghép nối hoàn tất video {dur_sec}s: {os.path.basename(out_path)}")
+            else:
+                shutil.copy2(clip_paths[0], out_path)
+                self.log_signal.emit(f"[{task_id}] Đã lưu video thành công: {os.path.basename(out_path)}")
+
+            # 7. Xóa logo watermark nếu bật checkbox
+            if self.strip_logo_enabled and task.get("strip_logo", True):
+                self.progress_signal.emit(task_id, 94, "Đang xóa logo...")
+                ok_logo, logo_reason = await asyncio.to_thread(strip_logo, out_path)
+                if ok_logo:
+                    self.log_signal.emit(f"[{task_id}] Đã xóa logo thành công.")
+                else:
+                    self.log_signal.emit(f"[{task_id}] Không thể xóa logo: {logo_reason}")
+
+            # 8. Ghép ảnh Outro 12s nếu bật checkbox (chỉ áp dụng khi video gốc 8s)
+            src_img = task.get("start_image")
+            if self.ghep_anh_12s and dur_sec == 8 and src_img and os.path.exists(src_img):
+                self.progress_signal.emit(task_id, 96, "Đang ghép ảnh 12s...")
+                self.log_signal.emit(f"[{task_id}] Đang ghép ảnh Outro tạo video 12s...")
+                ok_gh, gh_msg = await asyncio.to_thread(_run_ghep_anh_12s, out_path, src_img, out_path)
+                if ok_gh:
+                    self.log_signal.emit(f"[{task_id}] ✅ Đã ghép ảnh 12s thành công.")
+                else:
+                    self.log_signal.emit(f"[{task_id}] ⚠ Lỗi ghép ảnh 12s: {gh_msg}")
+
+            # 9. Xóa ảnh sản phẩm nếu bật checkbox
+            if self.del_img and src_img and os.path.exists(src_img):
                 try:
-                    event, data = await asyncio.wait_for(q.get(), timeout=900)
-                except asyncio.TimeoutError:
-                    self.log_signal.emit(f"[{task_id}] Hết thời gian chờ phản hồi từ server (15 phút). Trả sản phẩm về hàng đợi pending...")
-                    await self.release_shopee_task(task, "Timeout hàng chờ 15 phút")
-                    self.task_done_signal.emit(task_id, "", "Lỗi: Timeout chờ kết quả (đã trả về pending)")
-                    return False
+                    os.remove(src_img)
+                    self.log_signal.emit(f"[{task_id}] 🗑 Đã xóa ảnh sản phẩm: {os.path.basename(src_img)}")
+                except Exception:
+                    pass
 
-                if event == "ws_closed":
-                    raise Exception(data.get("error", "Kết nối WebSocket bị ngắt"))
+            # 10. Báo cáo trạng thái SP hoàn thành về Shopee Database Server
+            await self.report_shopee_status(task, "Hoàn thành", out_path)
 
-                if event in ("video_queued", "queued"):
-                    pos = data.get("queue_position", 1)
-                    self.progress_signal.emit(task_id, 20, f"Hàng chờ: vị trí {pos}")
-                    self.log_signal.emit(f"[{task_id}] Vị trí hàng chờ: {pos}")
-                elif event in ("video_processing", "progress", "job_processing"):
-                    progress_val = data.get("progress", 0)
-                    pct = int(20 + (progress_val * 0.6))
-                    self.progress_signal.emit(task_id, pct, f"Đang tạo video ({progress_val}%)")
-                elif event == "video_retry":
-                    self.progress_signal.emit(task_id, 35, "Server đang thử lại...")
-                    self.log_signal.emit(f"[{task_id}] Server gửi sự kiện video_retry, đang sinh lại...")
-                elif event == "video_upscaling":
-                    self.progress_signal.emit(task_id, 85, "Đang upscale 1080p...")
-                    self.log_signal.emit(f"[{task_id}] Đang nâng cấp lên 1080p...")
-                elif event in ("video_result", "job_result"):
-                    self.progress_signal.emit(task_id, 90, "Đang tải video kết quả...")
-                    self.log_signal.emit(f"[{task_id}] Nhận kết quả từ server: {event}")
-                    
-                    # Gửi result_ack cho server
-                    try:
-                        await session.send_json({
-                            "event": "result_ack",
-                            "data": {
-                                "task_id": task_id
-                            }
-                        })
-                    except Exception:
-                        pass
+            self.task_done_signal.emit(task_id, out_path, "Hoàn thành")
+            return True
 
-                    encoded_video = data.get("encoded_video") or data.get("inline_mp4")
-                    video_url = None
-                    
-                    if not encoded_video:
-                        res_raw = data.get("result")
-                        if isinstance(res_raw, dict):
-                            encoded_video = res_raw.get("encoded_video") or res_raw.get("inline_mp4")
-                            video_url = res_raw.get("download_url") or res_raw.get("url") or res_raw.get("video_url")
-                            if not video_url and res_raw.get("urls"):
-                                video_url = res_raw["urls"][0]
-                        elif isinstance(res_raw, list) and len(res_raw) > 0:
-                            first_res = res_raw[0]
-                            if isinstance(first_res, dict):
-                                encoded_video = first_res.get("encoded_video") or first_res.get("inline_mp4")
-                                video_url = first_res.get("download_url") or first_res.get("url") or first_res.get("video_url")
-                                if not video_url and first_res.get("urls"):
-                                    video_url = first_res["urls"][0]
-                            elif isinstance(first_res, str):
-                                video_url = first_res
-                                
-                        if not video_url and not encoded_video:
-                            video_url = data.get("download_url") or data.get("url") or data.get("video_url")
-                            if not video_url and data.get("urls"):
-                                video_url = data["urls"][0]
-                            
-                    img_name = "result"
-                    mode_str = str(getattr(self, "naming_mode", "Theo Item ID"))
-                    item_id = task.get("shopee_item_id") or task.get("link_item_id")
-                    row_idx = task.get("row_index", 0) + 1
-                    prompt_str = task.get("prompt", "").strip()
-
-                    if ("Item ID" in mode_str) and item_id:
-                        img_name = str(item_id)
-                    elif ("15" in mode_str or "13" in mode_str) and prompt_str:
-                        safe_prompt = re.sub(r'[\\/*?:"<>|]', '', prompt_str)
-                        lim = 15 if "15" in mode_str else 13
-                        img_name = safe_prompt[:lim].strip() or f"video_{task_id[:8]}"
-                    elif "thứ tự" in mode_str:
-                        img_name = f"{row_idx:03d}"
-                    elif task.get("start_image"):
-                        img_name = os.path.splitext(os.path.basename(task["start_image"]))[0]
-                    elif prompt_str:
-                        img_name = f"video_{slugify(prompt_str)[:20]}"
-                    else:
-                        img_name = f"video_{task_id[:8]}"
-                        
-                    out_path = os.path.join(self.output_dir, f"{img_name}.mp4")
-                    counter = 1
-                    while os.path.exists(out_path):
-                        out_path = os.path.join(self.output_dir, f"{img_name}_{counter}.mp4")
-                        counter += 1
-                    
-                    if encoded_video:
-                        try:
-                            import base64
-                            video_bytes = base64.b64decode(encoded_video)
-                            with open(out_path, "wb") as out_file:
-                                out_file.write(video_bytes)
-                            self.log_signal.emit(f"[{task_id}] Đã giải mã và lưu video thành công.")
-                        except Exception as e:
-                            await self.report_shopee_status(task, f"Lỗi giải mã base64: {e}", "")
-                            self.task_done_signal.emit(task_id, "", f"Lỗi giải mã base64: {e}")
-                            return False
-                    elif video_url:
-                        self.log_signal.emit(f"[{task_id}] Đang tải video từ: {video_url}")
-                        try:
-                            await asyncio.to_thread(self.download_file, video_url, out_path)
-                        except Exception as e:
-                            await self.report_shopee_status(task, f"Lỗi tải video: {e}", "")
-                            self.task_done_signal.emit(task_id, "", f"Lỗi tải video: {e}")
-                            return False
-                    else:
-                        # Kiểm tra xem có phải server báo chạm quota/cap không
-                        raw_err = data.get("error") or data.get("code") or data.get("message") or ""
-                        if any(x in str(raw_err).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
-                            raise DailyLimitExceeded()
-
-                        # Không có video: thường do Veo từ chối tạo (bộ lọc bản quyền / an toàn),
-                        # mã lỗi thật nằm trong data["error"] hoặc data["code"]
-                        res_lbl, code = classify_veo_error(data)
-                        if res_lbl:
-                            self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo video: {code} → {res_lbl}. Sản phẩm này sẽ bị loại khỏi hàng chờ.")
-                            await self.report_shopee_status(task, res_lbl, "")
-                        else:
-                            err_detail = raw_err or "Không tìm thấy dữ liệu video"
-                            self.log_signal.emit(f"[{task_id}] Máy chủ Veo gặp sự cố: {err_detail}. Trả sản phẩm về hàng đợi pending...")
-                            await self.release_shopee_task(task, str(err_detail))
-                            res_lbl = f"Lỗi server: {err_detail}"
-
-                        self.task_done_signal.emit(task_id, "", res_lbl)
-                        return False
-                        
-                    if self.strip_logo_enabled and task.get("strip_logo", True):
-                        self.progress_signal.emit(task_id, 92, "Đang xóa logo...")
-                        ok_logo, logo_reason = await asyncio.to_thread(strip_logo, out_path)
-                        if ok_logo:
-                            self.log_signal.emit(f"[{task_id}] Đã xóa logo thành công.")
-                        else:
-                            self.log_signal.emit(f"[{task_id}] Không thể xóa logo: {logo_reason}")
-
-                    # 1. Ghép ảnh 12s nếu bật checkbox (chạy trên background thread, không đơ UI)
-                    src_img = task.get("start_image")
-                    if self.ghep_anh_12s and src_img and os.path.exists(src_img):
-                        self.progress_signal.emit(task_id, 96, "Đang ghép ảnh 12s...")
-                        self.log_signal.emit(f"[{task_id}] Đang ghép ảnh Outro tạo video 12s...")
-                        ok_gh, gh_msg = await asyncio.to_thread(_run_ghep_anh_12s, out_path, src_img, out_path)
-                        if ok_gh:
-                            self.log_signal.emit(f"[{task_id}] ✅ Đã ghép ảnh 12s thành công.")
-                        else:
-                            self.log_signal.emit(f"[{task_id}] ⚠ Lỗi ghép ảnh 12s: {gh_msg}")
-
-                    # 2. Xóa ảnh sản phẩm nếu bật checkbox
-                    if self.del_img and src_img and os.path.exists(src_img):
-                        try:
-                            os.remove(src_img)
-                            self.log_signal.emit(f"[{task_id}] 🗑 Đã xóa ảnh sản phẩm: {os.path.basename(src_img)}")
-                        except Exception:
-                            pass
-
-                    # 3. Báo cáo trạng thái SP hoàn thành về Shopee Database Server
-                    await self.report_shopee_status(task, "Hoàn thành", out_path)
-                            
-                    self.task_done_signal.emit(task_id, out_path, "Hoàn thành")
-                    return True
-                elif event in ("error", "job_error"):
-                    err_msg = data.get("message") or data.get("detail") or data.get("reason") or data.get("error") or "Lỗi server không xác định"
-                    if any(x in str(err_msg).lower() for x in ["limit", "daily", "exceeded", "quota", "session prompt cap", "cap", "exhausted", "rpc_8", "flow_upload"]):
-                        raise DailyLimitExceeded()
-                    
-                    res_label, code = classify_veo_error(data)
-                    if res_label:
-                        self.log_signal.emit(f"[{task_id}] ⛔ Veo từ chối tạo video: {code} → {res_label}. Sản phẩm này sẽ bị loại khỏi hàng chờ.")
-                        await self.report_shopee_status(task, res_label, "")
-                    else:
-                        self.log_signal.emit(f"[{task_id}] Máy chủ Veo báo lỗi ({err_msg}). Trả sản phẩm về hàng đợi pending...")
-                        await self.release_shopee_task(task, str(err_msg))
-                        res_label = f"Lỗi server: {err_msg}"
-
-                    self.task_done_signal.emit(task_id, "", res_label)
-                    return False
-            return False
         finally:
-            session.task_events.pop(task_id, None)
+            try:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     def download_file(self, url, path):
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
